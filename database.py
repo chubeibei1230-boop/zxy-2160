@@ -454,6 +454,8 @@ class InMemoryDB:
                 )
                 res.overtime_minutes = int((now - res.end_time).total_seconds() // 60)
                 res.is_overtime = True
+            if res.status == ReservationStatus.OVERTIME:
+                res.status = ReservationStatus.RELEASED
             if locker.status in {LockerStatus.IN_USE, LockerStatus.PENDING_RELEASE}:
                 locker.status = LockerStatus.AVAILABLE
 
