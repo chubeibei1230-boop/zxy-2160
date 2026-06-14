@@ -12,6 +12,7 @@ from schemas import (
     AnomalyRecord, AnomalyRecordCreate, AnomalyRecordUpdate, AnomalyType, AnomalyStatus,
     ReservationFulfillmentDetail,
     ReservationWithFulfillment,
+    UserRiskReminder, ViolationType, CreditRecord,
 )
 from database import db
 from config import settings
@@ -76,6 +77,15 @@ def update_reservation(res_id: str, data: ReservationUpdate, _: User = Depends(r
         raise HTTPException(status_code=404, detail="预约记录不存在")
     if res.status not in {ReservationStatus.RESERVED}:
         raise HTTPException(status_code=400, detail="仅已预约状态可修改")
+
+    new_user_id = data.user_id_number if data.user_id_number else res.user_id_number
+    if data.user_id_number and data.user_id_number != res.user_id_number:
+        risk_reminder = db.get_user_risk_reminder(new_user_id)
+        if not risk_reminder.can_reserve:
+            raise HTTPException(
+                status_code=403,
+                detail=risk_reminder.warning_message or "该使用人已被限制预约",
+            )
 
     new_start = data.start_time if data.start_time else res.start_time
     new_end = data.end_time if data.end_time else res.end_time
@@ -340,6 +350,13 @@ def list_anomaly_types(_: User = Depends(require_reception)):
 
 @router.post("/reservations", response_model=Reservation, status_code=status.HTTP_201_CREATED)
 def create_reservation(data: ReservationCreate, current_user: User = Depends(require_reception)):
+    risk_reminder = db.get_user_risk_reminder(data.user_id_number)
+    if not risk_reminder.can_reserve:
+        raise HTTPException(
+            status_code=403,
+            detail=risk_reminder.warning_message or "该使用人已被限制预约",
+        )
+
     start_naive = data.start_time.replace(tzinfo=None) if data.start_time.tzinfo else data.start_time
     end_naive = data.end_time.replace(tzinfo=None) if data.end_time.tzinfo else data.end_time
     now = datetime.utcnow()
@@ -403,3 +420,26 @@ def create_reservation(data: ReservationCreate, current_user: User = Depends(req
     _validate_time_slot(data.start_time, data.end_time)
 
     return db.create_reservation(data, created_by=current_user.username)
+
+
+@router.get("/user-risk/{user_id_number}", response_model=UserRiskReminder)
+def get_user_risk_reminder(user_id_number: str, _: User = Depends(require_reception)):
+    return db.get_user_risk_reminder(user_id_number)
+
+
+@router.get("/user-credit-records/{user_id_number}", response_model=List[CreditRecord])
+def list_user_credit_records(
+    user_id_number: str,
+    violation_type: Optional[ViolationType] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: User = Depends(require_reception),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_credit_records(
+        user_id_number=user_id_number,
+        violation_type=violation_type,
+        start_date=sd,
+        end_date=ed,
+    )

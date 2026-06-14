@@ -14,6 +14,8 @@ from schemas import (
     Reservation, ReservationStatus,
     LockerAvailabilityCheck, LockerAnomalyImpact,
     AnomalyRecord,
+    RiskRule, RiskRuleCreate, RiskRuleUpdate,
+    ViolationType, UserCreditProfile,
 )
 from database import db
 
@@ -321,3 +323,71 @@ def restore_locker_with_check(locker_id: str, _: User = Depends(require_admin)):
     if not restored:
         raise HTTPException(status_code=500, detail="恢复储物格失败")
     return restored
+
+
+@router.post("/risk-rules", response_model=RiskRule, status_code=status.HTTP_201_CREATED)
+def create_risk_rule(data: RiskRuleCreate, _: User = Depends(require_admin)):
+    return db.create_risk_rule(data)
+
+
+@router.get("/risk-rules", response_model=List[RiskRule])
+def list_risk_rules(
+    violation_type: Optional[ViolationType] = None,
+    is_active: Optional[bool] = None,
+    _: User = Depends(require_admin),
+):
+    return db.list_risk_rules(violation_type=violation_type, is_active=is_active)
+
+
+@router.get("/risk-rules/{rule_id}", response_model=RiskRule)
+def get_risk_rule(rule_id: str, _: User = Depends(require_admin)):
+    rule = db.get_risk_rule(rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="风险规则不存在")
+    return rule
+
+
+@router.put("/risk-rules/{rule_id}", response_model=RiskRule)
+def update_risk_rule(rule_id: str, data: RiskRuleUpdate, _: User = Depends(require_admin)):
+    rule = db.update_risk_rule(rule_id, data)
+    if not rule:
+        raise HTTPException(status_code=404, detail="风险规则不存在")
+    return rule
+
+
+@router.delete("/risk-rules/{rule_id}", response_model=MessageResponse)
+def delete_risk_rule(rule_id: str, _: User = Depends(require_admin)):
+    if not db.delete_risk_rule(rule_id):
+        raise HTTPException(status_code=404, detail="风险规则不存在")
+    return MessageResponse(message="风险规则删除成功")
+
+
+@router.post("/user-credit/{user_id_number}/lift-restriction", response_model=UserCreditProfile)
+def lift_restriction(
+    user_id_number: str,
+    notes: Optional[str] = None,
+    current_user: User = Depends(require_admin),
+):
+    profile = db.manually_lift_restriction(user_id_number, current_user.username, notes)
+    if not profile:
+        raise HTTPException(status_code=404, detail="用户信用记录不存在或未被限制")
+    return profile
+
+
+@router.post("/user-credit/{user_id_number}/restrict", response_model=UserCreditProfile)
+def manually_restrict_user(
+    user_id_number: str,
+    restriction_days: int = 30,
+    notes: Optional[str] = None,
+    current_user: User = Depends(require_admin),
+):
+    profile = db.manually_restrict_user(user_id_number, current_user.username, restriction_days, notes)
+    return profile
+
+
+@router.get("/user-credit/{user_id_number}", response_model=UserCreditProfile)
+def get_user_credit_profile(user_id_number: str, _: User = Depends(require_admin)):
+    profile = db.get_user_credit_profile(user_id_number)
+    if not profile:
+        raise HTTPException(status_code=404, detail="用户信用记录不存在")
+    return profile

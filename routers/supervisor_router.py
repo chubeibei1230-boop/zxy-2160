@@ -11,6 +11,8 @@ from schemas import (
     MessageResponse, AnomalyStatistics,
     AnomalyRecordWithRelations, AnomalyResolveData, AnomalyTypeDistribution,
     AreaAnomalySummary,
+    RiskLevel, UserCreditProfile, UserRiskReminder, ViolationType, CreditRecord,
+    SupervisorRiskAction,
 )
 from database import db
 
@@ -285,3 +287,79 @@ def get_anomaly_statistics_enhanced(
     _: User = Depends(require_supervisor),
 ):
     return db.get_anomaly_statistics(area_id=area_id)
+
+
+@router.get("/high-risk-users", response_model=List[UserCreditProfile])
+def list_high_risk_users(
+    min_risk_level: RiskLevel = RiskLevel.MEDIUM_RISK,
+    _: User = Depends(require_supervisor),
+):
+    return db.list_high_risk_users(min_risk_level=min_risk_level)
+
+
+@router.get("/user-credit/{user_id_number}", response_model=UserCreditProfile)
+def get_user_credit_profile(user_id_number: str, _: User = Depends(require_supervisor)):
+    profile = db.get_user_credit_profile(user_id_number)
+    if not profile:
+        raise HTTPException(status_code=404, detail="用户信用记录不存在")
+    return profile
+
+
+@router.get("/user-risk/{user_id_number}", response_model=UserRiskReminder)
+def get_user_risk_reminder(user_id_number: str, _: User = Depends(require_supervisor)):
+    return db.get_user_risk_reminder(user_id_number)
+
+
+@router.get("/user-credit-records/{user_id_number}", response_model=List[CreditRecord])
+def list_user_credit_records(
+    user_id_number: str,
+    violation_type: Optional[ViolationType] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: User = Depends(require_supervisor),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_credit_records(
+        user_id_number=user_id_number,
+        violation_type=violation_type,
+        start_date=sd,
+        end_date=ed,
+    )
+
+
+@router.post("/user-credit/{user_id_number}/action", response_model=UserCreditProfile)
+def supervisor_risk_action(
+    user_id_number: str,
+    data: SupervisorRiskAction,
+    current_user: User = Depends(require_supervisor),
+):
+    profile = db.get_user_credit_profile(user_id_number)
+    if not profile:
+        raise HTTPException(status_code=404, detail="用户信用记录不存在")
+
+    if data.action == "confirm":
+        updated = db.supervisor_confirm_risk(user_id_number, current_user.username, data.notes)
+        if not updated:
+            raise HTTPException(status_code=500, detail="确认风险状态失败")
+        return updated
+    elif data.action == "lift":
+        updated = db.manually_lift_restriction(user_id_number, current_user.username, data.notes)
+        if not updated:
+            raise HTTPException(status_code=400, detail="该用户未被限制，无法解除")
+        return updated
+    elif data.action == "restrict":
+        restriction_days = data.restriction_days or 30
+        updated = db.manually_restrict_user(user_id_number, current_user.username, restriction_days, data.notes)
+        return updated
+    elif data.action == "note":
+        if data.notes:
+            existing = profile.restriction_reason or ""
+            profile.restriction_reason = existing + f" | 备注({current_user.username}): {data.notes}" if existing else f"备注({current_user.username}): {data.notes}"
+            profile.last_updated = datetime.utcnow()
+        return profile
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="不支持的操作类型，可选: confirm, lift, restrict, note",
+        )

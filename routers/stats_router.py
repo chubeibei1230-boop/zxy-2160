@@ -14,6 +14,7 @@ from schemas import (
     AnomalyStatistics, ReservationFulfillmentDetail, LockerAvailabilityCheck,
     ReservationWithFulfillment, AnomalyTypeDistribution, AreaAnomalySummary,
     FulfillmentOverview, AnomalyRecordWithRelations,
+    CreditRiskStatistics, UserCreditProfile, UserRiskReminder, ViolationType, CreditRecord,
 )
 from database import db
 from config import settings
@@ -44,6 +45,7 @@ def run_anomaly_detection() -> List[AnomalyRecord]:
                         description=f"预约已超过签到时限未签到，使用人: {res.user_name}",
                     ))
                     new_anomalies.append(anomaly)
+                    db.record_violation_from_anomaly(anomaly)
 
         if res.status == ReservationStatus.CHECKED_IN and res.release is None:
             if now > res.end_time + timedelta(minutes=settings.overtime_grace_minutes):
@@ -60,6 +62,7 @@ def run_anomaly_detection() -> List[AnomalyRecord]:
                         description=f"使用人 {res.user_name} 占用已超时 {res.overtime_minutes} 分钟",
                     ))
                     new_anomalies.append(anomaly)
+                    db.record_violation_from_anomaly(anomaly)
 
         if res.status in (ReservationStatus.RELEASED, ReservationStatus.OVERTIME) and res.release:
             locker = db.get_locker(res.locker_id)
@@ -75,6 +78,7 @@ def run_anomaly_detection() -> List[AnomalyRecord]:
                             description=f"预约释放后超过1小时未确认释放，使用人: {res.user_name}",
                         ))
                         new_anomalies.append(anomaly)
+                        db.record_violation_from_anomaly(anomaly)
 
     all_lockers = db.list_lockers()
     for locker in all_lockers:
@@ -92,6 +96,7 @@ def run_anomaly_detection() -> List[AnomalyRecord]:
                             description=f"已停用储物格 {locker.locker_number} 仍存在未完成预约，使用人: {res.user_name}",
                         ))
                         new_anomalies.append(anomaly)
+                        db.record_violation_from_anomaly(anomaly)
 
     return new_anomalies
 
@@ -350,3 +355,107 @@ def get_fulfillment_overview_public(
     _: User = Depends(require_any_authenticated),
 ):
     return db.get_fulfillment_overview(area_id=area_id)
+
+
+@router.get("/stats/credit-risk", response_model=CreditRiskStatistics)
+def get_credit_risk_statistics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.get_credit_risk_statistics(start_date=sd, end_date=ed)
+
+
+@router.get("/stats/credit-risk-distribution", response_model=List[dict])
+def get_credit_risk_distribution(_: User = Depends(require_any_authenticated)):
+    stats = db.get_credit_risk_statistics()
+    return [
+        {
+            "risk_level": d.risk_level.value,
+            "risk_level_label": d.risk_level_label,
+            "count": d.count,
+            "percentage": d.percentage,
+        }
+        for d in stats.distribution
+    ]
+
+
+@router.get("/stats/violation-ranking", response_model=List[dict])
+def get_violation_ranking(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    top_n: int = Query(10, ge=1, le=100),
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    stats = db.get_credit_risk_statistics(start_date=sd, end_date=ed)
+    ranking = stats.violation_ranking[:top_n]
+    return [
+        {
+            "user_name": r.user_name,
+            "user_id_number": r.user_id_number,
+            "total_violations": r.total_violations,
+            "violation_counts": r.violation_counts,
+            "risk_level": r.risk_level.value,
+        }
+        for r in ranking
+    ]
+
+
+@router.get("/stats/risk-trend", response_model=List[dict])
+def get_risk_trend(
+    start_date: str,
+    end_date: str,
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date()
+    ed = datetime.fromisoformat(end_date).date()
+    stats = db.get_credit_risk_statistics(start_date=sd, end_date=ed)
+    return [
+        {
+            "date": t.date.isoformat(),
+            "new_violations": t.new_violations,
+            "total_restricted": t.total_restricted,
+        }
+        for t in stats.risk_trend
+    ]
+
+
+@router.get("/user-risk/{user_id_number}", response_model=UserRiskReminder)
+def get_user_risk_reminder_public(
+    user_id_number: str,
+    _: User = Depends(require_any_authenticated),
+):
+    return db.get_user_risk_reminder(user_id_number)
+
+
+@router.get("/user-credit/{user_id_number}", response_model=UserCreditProfile)
+def get_user_credit_profile_public(
+    user_id_number: str,
+    _: User = Depends(require_any_authenticated),
+):
+    profile = db.get_user_credit_profile(user_id_number)
+    if not profile:
+        raise HTTPException(status_code=404, detail="用户信用记录不存在")
+    return profile
+
+
+@router.get("/user-credit-records/{user_id_number}", response_model=List[CreditRecord])
+def list_user_credit_records_public(
+    user_id_number: str,
+    violation_type: Optional[ViolationType] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_credit_records(
+        user_id_number=user_id_number,
+        violation_type=violation_type,
+        start_date=sd,
+        end_date=ed,
+    )

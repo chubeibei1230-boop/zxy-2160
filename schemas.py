@@ -446,6 +446,161 @@ class AreaAnomalySummary(BaseModel):
     rejected: int = 0
 
 
+class RiskLevel(str, Enum):
+    NORMAL = "normal"
+    LOW_RISK = "low_risk"
+    MEDIUM_RISK = "medium_risk"
+    HIGH_RISK = "high_risk"
+    RESTRICTED = "restricted"
+
+
+class ViolationType(str, Enum):
+    NO_SHOW = "no_show"
+    OVERTIME = "overtime"
+    ABNORMAL_OCCUPANCY = "abnormal_occupancy"
+    RELEASE_UNCONFIRMED = "release_unconfirmed"
+
+
+RISK_LEVEL_LABELS = {
+    RiskLevel.NORMAL: "正常",
+    RiskLevel.LOW_RISK: "低风险",
+    RiskLevel.MEDIUM_RISK: "中风险",
+    RiskLevel.HIGH_RISK: "高风险",
+    RiskLevel.RESTRICTED: "已限制",
+}
+
+VIOLATION_TYPE_LABELS = {
+    ViolationType.NO_SHOW: "未签到",
+    ViolationType.OVERTIME: "超时使用",
+    ViolationType.ABNORMAL_OCCUPANCY: "异常占用",
+    ViolationType.RELEASE_UNCONFIRMED: "释放未确认",
+}
+
+
+class CreditRecordBase(BaseModel):
+    user_id_number: str
+    user_phone: Optional[str] = None
+    user_name: Optional[str] = None
+    violation_type: ViolationType
+    reservation_id: Optional[str] = None
+    anomaly_record_id: Optional[str] = None
+    description: str
+
+
+class CreditRecordCreate(CreditRecordBase):
+    pass
+
+
+class CreditRecord(CreditRecordBase):
+    id: str
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RiskRuleBase(BaseModel):
+    name: str
+    violation_type: ViolationType
+    low_risk_threshold: int = 1
+    medium_risk_threshold: int = 3
+    high_risk_threshold: int = 5
+    restricted_threshold: int = 8
+    time_window_days: int = 90
+    restriction_days: int = 30
+    is_active: bool = True
+
+
+class RiskRuleCreate(RiskRuleBase):
+    pass
+
+
+class RiskRuleUpdate(BaseModel):
+    name: Optional[str] = None
+    low_risk_threshold: Optional[int] = None
+    medium_risk_threshold: Optional[int] = None
+    high_risk_threshold: Optional[int] = None
+    restricted_threshold: Optional[int] = None
+    time_window_days: Optional[int] = None
+    restriction_days: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class RiskRule(RiskRuleBase):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserCreditProfile(BaseModel):
+    user_id_number: str
+    user_phone: Optional[str] = None
+    user_name: Optional[str] = None
+    risk_level: RiskLevel = RiskLevel.NORMAL
+    violation_counts: Dict[str, int] = {}
+    total_violations: int = 0
+    is_restricted: bool = False
+    restriction_until: Optional[datetime] = None
+    restriction_reason: Optional[str] = None
+    manually_lifted: bool = False
+    last_violation_at: Optional[datetime] = None
+    last_updated: Optional[datetime] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserRiskReminder(BaseModel):
+    user_id_number: str
+    user_name: Optional[str] = None
+    user_phone: Optional[str] = None
+    risk_level: RiskLevel
+    risk_level_label: str
+    total_violations: int
+    violation_counts: Dict[str, int] = {}
+    is_restricted: bool = False
+    restriction_until: Optional[datetime] = None
+    can_reserve: bool = True
+    warning_message: Optional[str] = None
+    recent_violations: List[CreditRecord] = []
+
+
+class SupervisorRiskAction(BaseModel):
+    action: str
+    notes: Optional[str] = None
+    restriction_days: Optional[int] = None
+
+
+class CreditRiskDistribution(BaseModel):
+    risk_level: RiskLevel
+    risk_level_label: str
+    count: int
+    percentage: float
+
+
+class ViolationRankingItem(BaseModel):
+    user_name: Optional[str] = None
+    user_id_number: str
+    total_violations: int
+    violation_counts: Dict[str, int] = {}
+    risk_level: RiskLevel
+
+
+class RiskTrendItem(BaseModel):
+    date: date
+    new_violations: int
+    total_restricted: int
+
+
+class CreditRiskStatistics(BaseModel):
+    total_users: int = 0
+    normal_count: int = 0
+    low_risk_count: int = 0
+    medium_risk_count: int = 0
+    high_risk_count: int = 0
+    restricted_count: int = 0
+    distribution: List[CreditRiskDistribution] = []
+    violation_ranking: List[ViolationRankingItem] = []
+    risk_trend: List[RiskTrendItem] = []
+
+
 class FulfillmentOverview(BaseModel):
     total_reservations: int = 0
     stage_reserved: int = 0

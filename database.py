@@ -18,6 +18,11 @@ from schemas import (
     ReservationWithFulfillment, AnomalyRecordWithRelations,
     AnomalyTypeDistribution, AreaAnomalySummary, FulfillmentOverview,
     AnomalyResolveData,
+    RiskLevel, ViolationType, RISK_LEVEL_LABELS, VIOLATION_TYPE_LABELS,
+    CreditRecord, CreditRecordCreate,
+    RiskRule, RiskRuleCreate, RiskRuleUpdate,
+    UserCreditProfile, UserRiskReminder,
+    CreditRiskDistribution, ViolationRankingItem, RiskTrendItem, CreditRiskStatistics,
 )
 from config import settings
 
@@ -40,8 +45,12 @@ class InMemoryDB:
         self.disable_reasons: Dict[str, DisableReason] = {}
         self.reservations: Dict[str, Reservation] = {}
         self.anomaly_records: Dict[str, AnomalyRecord] = {}
+        self.credit_records: Dict[str, CreditRecord] = {}
+        self.user_credit_profiles: Dict[str, UserCreditProfile] = {}
+        self.risk_rules: Dict[str, RiskRule] = {}
         self._init_default_users()
         self._init_default_rule()
+        self._init_default_risk_rules()
 
     def _init_default_users(self):
         from passlib.context import CryptContext
@@ -72,6 +81,69 @@ class InMemoryDB:
             updated_at=now,
         )
         self.usage_rules[rule.id] = rule
+
+    def _init_default_risk_rules(self):
+        now = datetime.utcnow()
+        default_rules = [
+            RiskRule(
+                id=self._gen_id(),
+                name="未签到风险规则",
+                violation_type=ViolationType.NO_SHOW,
+                low_risk_threshold=1,
+                medium_risk_threshold=2,
+                high_risk_threshold=3,
+                restricted_threshold=4,
+                time_window_days=90,
+                restriction_days=30,
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+            RiskRule(
+                id=self._gen_id(),
+                name="超时使用风险规则",
+                violation_type=ViolationType.OVERTIME,
+                low_risk_threshold=1,
+                medium_risk_threshold=3,
+                high_risk_threshold=5,
+                restricted_threshold=8,
+                time_window_days=90,
+                restriction_days=30,
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+            RiskRule(
+                id=self._gen_id(),
+                name="异常占用风险规则",
+                violation_type=ViolationType.ABNORMAL_OCCUPANCY,
+                low_risk_threshold=1,
+                medium_risk_threshold=2,
+                high_risk_threshold=3,
+                restricted_threshold=4,
+                time_window_days=90,
+                restriction_days=30,
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+            RiskRule(
+                id=self._gen_id(),
+                name="释放未确认风险规则",
+                violation_type=ViolationType.RELEASE_UNCONFIRMED,
+                low_risk_threshold=1,
+                medium_risk_threshold=3,
+                high_risk_threshold=5,
+                restricted_threshold=8,
+                time_window_days=90,
+                restriction_days=30,
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            ),
+        ]
+        for rule in default_rules:
+            self.risk_rules[rule.id] = rule
 
     @staticmethod
     def _gen_id() -> str:
@@ -339,12 +411,13 @@ class InMemoryDB:
             res.is_overtime = True
             if res.overtime_minutes > settings.overtime_grace_minutes:
                 res.status = ReservationStatus.OVERTIME
-                self.create_anomaly_record(AnomalyRecordCreate(
+                anomaly = self.create_anomaly_record(AnomalyRecordCreate(
                     type=AnomalyType.OVERTIME,
                     reservation_id=res.id,
                     locker_id=res.locker_id,
                     description=f"使用人 {res.user_name} 超时 {res.overtime_minutes} 分钟释放",
                 ))
+                self.record_violation_from_anomaly(anomaly)
             else:
                 res.status = ReservationStatus.RELEASED
         else:
@@ -1212,6 +1285,389 @@ class InMemoryDB:
         locker = self.get_locker(record.locker_id) if record.locker_id else (self.get_locker(res.locker_id) if res else None)
         self._sync_anomaly_resolved(record, res, locker)
         return record
+
+    def create_credit_record(self, data: CreditRecordCreate) -> CreditRecord:
+        record = CreditRecord(
+            id=self._gen_id(),
+            **data.model_dump(),
+            created_at=datetime.utcnow(),
+        )
+        self.credit_records[record.id] = record
+        self._update_user_credit_profile(record.user_id_number)
+        return record
+
+    def get_credit_record(self, record_id: str) -> Optional[CreditRecord]:
+        return self.credit_records.get(record_id)
+
+    def list_credit_records(
+        self,
+        user_id_number: Optional[str] = None,
+        violation_type: Optional[ViolationType] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> List[CreditRecord]:
+        result = list(self.credit_records.values())
+        if user_id_number:
+            result = [c for c in result if c.user_id_number == user_id_number]
+        if violation_type:
+            result = [c for c in result if c.violation_type == violation_type]
+        if start_date:
+            result = [c for c in result if c.created_at.date() >= start_date]
+        if end_date:
+            result = [c for c in result if c.created_at.date() <= end_date]
+        return result
+
+    def get_user_credit_profile(self, user_id_number: str) -> Optional[UserCreditProfile]:
+        return self.user_credit_profiles.get(user_id_number)
+
+    def _get_or_create_credit_profile(self, user_id_number: str) -> UserCreditProfile:
+        profile = self.user_credit_profiles.get(user_id_number)
+        if not profile:
+            profile = UserCreditProfile(
+                user_id_number=user_id_number,
+                violation_counts={vt.value: 0 for vt in ViolationType},
+                last_updated=datetime.utcnow(),
+            )
+            self.user_credit_profiles[user_id_number] = profile
+        return profile
+
+    def _update_user_credit_profile(self, user_id_number: str) -> UserCreditProfile:
+        profile = self._get_or_create_credit_profile(user_id_number)
+        now = datetime.utcnow()
+
+        for res in self.reservations.values():
+            if res.user_id_number == user_id_number:
+                if profile.user_name is None and res.user_name:
+                    profile.user_name = res.user_name
+                if profile.user_phone is None and res.user_phone:
+                    profile.user_phone = res.user_phone
+
+        active_rules = {rule.violation_type: rule for rule in self.risk_rules.values() if rule.is_active}
+
+        for vt in ViolationType:
+            rule = active_rules.get(vt)
+            if rule:
+                window_start = now - timedelta(days=rule.time_window_days)
+                count = len([
+                    c for c in self.credit_records.values()
+                    if c.user_id_number == user_id_number
+                    and c.violation_type == vt
+                    and c.created_at >= window_start
+                ])
+            else:
+                count = len([
+                    c for c in self.credit_records.values()
+                    if c.user_id_number == user_id_number and c.violation_type == vt
+                ])
+            profile.violation_counts[vt.value] = count
+
+        total = sum(profile.violation_counts.values())
+        profile.total_violations = total
+
+        user_records = [c for c in self.credit_records.values() if c.user_id_number == user_id_number]
+        if user_records:
+            profile.last_violation_at = max(c.created_at for c in user_records)
+
+        max_risk = RiskLevel.NORMAL
+        restriction_rule = None
+        for vt, rule in active_rules.items():
+            count = profile.violation_counts.get(vt.value, 0)
+            if count >= rule.restricted_threshold:
+                if max_risk != RiskLevel.RESTRICTED:
+                    max_risk = RiskLevel.RESTRICTED
+                    restriction_rule = rule
+            elif count >= rule.high_risk_threshold:
+                if max_risk.value < RiskLevel.HIGH_RISK.value:
+                    max_risk = RiskLevel.HIGH_RISK
+            elif count >= rule.medium_risk_threshold:
+                if max_risk.value < RiskLevel.MEDIUM_RISK.value:
+                    max_risk = RiskLevel.MEDIUM_RISK
+            elif count >= rule.low_risk_threshold:
+                if max_risk.value < RiskLevel.LOW_RISK.value:
+                    max_risk = RiskLevel.LOW_RISK
+
+        if profile.manually_lifted and max_risk == RiskLevel.RESTRICTED:
+            max_risk = RiskLevel.HIGH_RISK
+
+        profile.risk_level = max_risk
+
+        if max_risk == RiskLevel.RESTRICTED and restriction_rule:
+            profile.is_restricted = True
+            if not profile.restriction_until or profile.restriction_until < now:
+                profile.restriction_until = now + timedelta(days=restriction_rule.restriction_days)
+                profile.restriction_reason = f"违规次数达到限制阈值（{restriction_rule.name}）"
+        elif profile.restriction_until and profile.restriction_until < now:
+            profile.is_restricted = False
+            profile.restriction_until = None
+            profile.restriction_reason = None
+        else:
+            profile.is_restricted = max_risk == RiskLevel.RESTRICTED
+
+        profile.last_updated = now
+        return profile
+
+    def refresh_all_credit_profiles(self):
+        for user_id_number in list(self.user_credit_profiles.keys()):
+            self._update_user_credit_profile(user_id_number)
+
+    def get_user_risk_reminder(self, user_id_number: str) -> UserRiskReminder:
+        profile = self._get_or_create_credit_profile(user_id_number)
+        self._update_user_credit_profile(user_id_number)
+        profile = self.user_credit_profiles[user_id_number]
+
+        now = datetime.utcnow()
+        can_reserve = True
+        warning_message = None
+
+        if profile.is_restricted:
+            if profile.restriction_until and profile.restriction_until > now:
+                can_reserve = False
+                days_left = (profile.restriction_until - now).days
+                warning_message = f"该使用人已被限制预约，限制至 {profile.restriction_until.strftime('%Y-%m-%d')}（剩余{days_left}天），原因：{profile.restriction_reason or '违规次数过多'}"
+            else:
+                can_reserve = True
+                self._update_user_credit_profile(user_id_number)
+                profile = self.user_credit_profiles[user_id_number]
+        elif profile.risk_level == RiskLevel.HIGH_RISK:
+            warning_message = f"该使用人信用风险等级为高风险，共有{profile.total_violations}次违规记录，请谨慎操作"
+        elif profile.risk_level == RiskLevel.MEDIUM_RISK:
+            warning_message = f"该使用人信用风险等级为中风险，共有{profile.total_violations}次违规记录"
+        elif profile.risk_level == RiskLevel.LOW_RISK:
+            warning_message = f"该使用人信用风险等级为低风险，共有{profile.total_violations}次违规记录"
+
+        recent_cutoff = now - timedelta(days=30)
+        recent_violations = [
+            c for c in self.credit_records.values()
+            if c.user_id_number == user_id_number and c.created_at >= recent_cutoff
+        ]
+        recent_violations.sort(key=lambda c: c.created_at, reverse=True)
+        recent_violations = recent_violations[:10]
+
+        return UserRiskReminder(
+            user_id_number=user_id_number,
+            user_name=profile.user_name,
+            user_phone=profile.user_phone,
+            risk_level=profile.risk_level,
+            risk_level_label=RISK_LEVEL_LABELS.get(profile.risk_level, profile.risk_level.value),
+            total_violations=profile.total_violations,
+            violation_counts=profile.violation_counts,
+            is_restricted=profile.is_restricted,
+            restriction_until=profile.restriction_until,
+            can_reserve=can_reserve,
+            warning_message=warning_message,
+            recent_violations=recent_violations,
+        )
+
+    def can_user_reserve(self, user_id_number: str) -> bool:
+        reminder = self.get_user_risk_reminder(user_id_number)
+        return reminder.can_reserve
+
+    def create_risk_rule(self, data: RiskRuleCreate) -> RiskRule:
+        now = datetime.utcnow()
+        rule = RiskRule(
+            id=self._gen_id(),
+            **data.model_dump(),
+            created_at=now,
+            updated_at=now,
+        )
+        self.risk_rules[rule.id] = rule
+        return rule
+
+    def get_risk_rule(self, rule_id: str) -> Optional[RiskRule]:
+        return self.risk_rules.get(rule_id)
+
+    def list_risk_rules(self, violation_type: Optional[ViolationType] = None, is_active: Optional[bool] = None) -> List[RiskRule]:
+        result = list(self.risk_rules.values())
+        if violation_type:
+            result = [r for r in result if r.violation_type == violation_type]
+        if is_active is not None:
+            result = [r for r in result if r.is_active == is_active]
+        return result
+
+    def update_risk_rule(self, rule_id: str, data: RiskRuleUpdate) -> Optional[RiskRule]:
+        rule = self.risk_rules.get(rule_id)
+        if not rule:
+            return None
+        update_data = data.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(rule, key, value)
+        rule.updated_at = datetime.utcnow()
+        self.refresh_all_credit_profiles()
+        return rule
+
+    def delete_risk_rule(self, rule_id: str) -> bool:
+        if rule_id in self.risk_rules:
+            del self.risk_rules[rule_id]
+            self.refresh_all_credit_profiles()
+            return True
+        return False
+
+    def manually_lift_restriction(self, user_id_number: str, operator: str, notes: Optional[str] = None) -> Optional[UserCreditProfile]:
+        profile = self.user_credit_profiles.get(user_id_number)
+        if not profile:
+            return None
+        if not profile.is_restricted:
+            return None
+        profile.manually_lifted = True
+        profile.is_restricted = False
+        profile.restriction_until = None
+        profile.restriction_reason = f"由 {operator} 人工解除限制" + (f"：{notes}" if notes else "")
+        profile.last_updated = datetime.utcnow()
+        self._update_user_credit_profile(user_id_number)
+        return self.user_credit_profiles[user_id_number]
+
+    def manually_restrict_user(self, user_id_number: str, operator: str, restriction_days: int = 30, notes: Optional[str] = None) -> Optional[UserCreditProfile]:
+        profile = self._get_or_create_credit_profile(user_id_number)
+        now = datetime.utcnow()
+        profile.is_restricted = True
+        profile.restriction_until = now + timedelta(days=restriction_days)
+        profile.restriction_reason = f"由 {operator} 人工设置限制" + (f"：{notes}" if notes else "")
+        profile.manually_lifted = False
+        profile.last_updated = now
+        return profile
+
+    def supervisor_confirm_risk(self, user_id_number: str, operator: str, notes: Optional[str] = None) -> Optional[UserCreditProfile]:
+        profile = self.user_credit_profiles.get(user_id_number)
+        if not profile:
+            return None
+        if notes:
+            existing = profile.restriction_reason or ""
+            profile.restriction_reason = existing + f" | 监督确认({operator}): {notes}" if existing else f"监督确认({operator}): {notes}"
+        profile.last_updated = datetime.utcnow()
+        return profile
+
+    def list_high_risk_users(self, min_risk_level: RiskLevel = RiskLevel.MEDIUM_RISK) -> List[UserCreditProfile]:
+        risk_order = {
+            RiskLevel.NORMAL: 0,
+            RiskLevel.LOW_RISK: 1,
+            RiskLevel.MEDIUM_RISK: 2,
+            RiskLevel.HIGH_RISK: 3,
+            RiskLevel.RESTRICTED: 4,
+        }
+        min_order = risk_order.get(min_risk_level, 0)
+        result = [
+            p for p in self.user_credit_profiles.values()
+            if risk_order.get(p.risk_level, 0) >= min_order
+        ]
+        result.sort(key=lambda p: (-risk_order.get(p.risk_level, 0), -p.total_violations))
+        return result
+
+    def get_credit_risk_statistics(self, start_date: Optional[date] = None, end_date: Optional[date] = None) -> CreditRiskStatistics:
+        all_profiles = list(self.user_credit_profiles.values())
+        total_users = len(all_profiles)
+
+        risk_counts = {rl: 0 for rl in RiskLevel}
+        for p in all_profiles:
+            risk_counts[p.risk_level] = risk_counts.get(p.risk_level, 0) + 1
+
+        distribution = []
+        for rl in RiskLevel:
+            count = risk_counts.get(rl, 0)
+            pct = round(((count / total_users) * 100) if total_users > 0 else 0.0, 2)
+            distribution.append(CreditRiskDistribution(
+                risk_level=rl,
+                risk_level_label=RISK_LEVEL_LABELS.get(rl, rl.value),
+                count=count,
+                percentage=pct,
+            ))
+
+        user_violation_map: Dict[str, Dict] = {}
+        for c in self.credit_records.values():
+            if start_date and c.created_at.date() < start_date:
+                continue
+            if end_date and c.created_at.date() > end_date:
+                continue
+            if c.user_id_number not in user_violation_map:
+                profile = self.user_credit_profiles.get(c.user_id_number)
+                user_violation_map[c.user_id_number] = {
+                    "user_name": c.user_name or (profile.user_name if profile else None),
+                    "total": 0,
+                    "counts": {vt.value: 0 for vt in ViolationType},
+                    "risk_level": profile.risk_level if profile else RiskLevel.NORMAL,
+                }
+            user_violation_map[c.user_id_number]["total"] += 1
+            user_violation_map[c.user_id_number]["counts"][c.violation_type.value] += 1
+
+        ranking = [
+            ViolationRankingItem(
+                user_name=v["user_name"],
+                user_id_number=k,
+                total_violations=v["total"],
+                violation_counts=v["counts"],
+                risk_level=v["risk_level"],
+            )
+            for k, v in user_violation_map.items()
+        ]
+        ranking.sort(key=lambda x: -x.total_violations)
+
+        trend = []
+        if start_date and end_date:
+            current = start_date
+            while current <= end_date:
+                day_violations = len([
+                    c for c in self.credit_records.values()
+                    if c.created_at.date() == current
+                ])
+                day_restricted = len([
+                    p for p in all_profiles
+                    if p.is_restricted and p.restriction_until and p.restriction_until.date() >= current
+                ])
+                trend.append(RiskTrendItem(
+                    date=current,
+                    new_violations=day_violations,
+                    total_restricted=day_restricted,
+                ))
+                current += timedelta(days=1)
+
+        return CreditRiskStatistics(
+            total_users=total_users,
+            normal_count=risk_counts.get(RiskLevel.NORMAL, 0),
+            low_risk_count=risk_counts.get(RiskLevel.LOW_RISK, 0),
+            medium_risk_count=risk_counts.get(RiskLevel.MEDIUM_RISK, 0),
+            high_risk_count=risk_counts.get(RiskLevel.HIGH_RISK, 0),
+            restricted_count=risk_counts.get(RiskLevel.RESTRICTED, 0),
+            distribution=distribution,
+            violation_ranking=ranking,
+            risk_trend=trend,
+        )
+
+    def _anomaly_type_to_violation_type(self, anomaly_type: AnomalyType) -> Optional[ViolationType]:
+        mapping = {
+            AnomalyType.NO_SHOW: ViolationType.NO_SHOW,
+            AnomalyType.OVERTIME: ViolationType.OVERTIME,
+            AnomalyType.ABNORMAL_OCCUPANCY: ViolationType.ABNORMAL_OCCUPANCY,
+            AnomalyType.RELEASE_CONFIRM_MISSING: ViolationType.RELEASE_UNCONFIRMED,
+        }
+        return mapping.get(anomaly_type)
+
+    def record_violation_from_anomaly(self, anomaly: AnomalyRecord) -> Optional[CreditRecord]:
+        violation_type = self._anomaly_type_to_violation_type(anomaly.type)
+        if not violation_type:
+            return None
+
+        res = self.get_reservation(anomaly.reservation_id) if anomaly.reservation_id else None
+        if not res:
+            return None
+
+        user_id_number = res.user_id_number
+        existing = [
+            c for c in self.credit_records.values()
+            if c.user_id_number == user_id_number
+            and c.anomaly_record_id == anomaly.id
+        ]
+        if existing:
+            return None
+
+        data = CreditRecordCreate(
+            user_id_number=user_id_number,
+            user_phone=res.user_phone,
+            user_name=res.user_name,
+            violation_type=violation_type,
+            reservation_id=res.id,
+            anomaly_record_id=anomaly.id,
+            description=anomaly.description,
+        )
+        return self.create_credit_record(data)
 
 
 db = InMemoryDB()
