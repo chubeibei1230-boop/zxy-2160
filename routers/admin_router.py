@@ -100,13 +100,12 @@ def update_locker(locker_id: str, data: LockerUpdate, _: User = Depends(require_
                     detail=f"无法直接停用储物格: {reasons}。请使用停用接口（POST /admin/lockers/{{id}}/disable）并填写停用原因。",
                 )
         elif data.status == LockerStatus.AVAILABLE:
-            if locker.status == LockerStatus.DISABLED:
-                if not check or not check.can_restore:
-                    reasons = "; ".join(check.blocking_reasons) if check else "未知原因"
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"无法直接恢复储物格: {reasons}。请使用恢复接口（POST /admin/lockers/{{id}}/restore）。",
-                    )
+            if not check or not check.can_restore or check.active_reservations or check.unresolved_anomalies:
+                reasons = "; ".join(check.blocking_reasons) if check else "未知原因"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"无法直接恢复储物格: {reasons}。请先处理未完成预约或异常记录。",
+                )
         elif data.status in {LockerStatus.IN_USE, LockerStatus.RESERVED, LockerStatus.PENDING_RELEASE}:
             raise HTTPException(
                 status_code=400,
