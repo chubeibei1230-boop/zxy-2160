@@ -8,7 +8,7 @@ from auth import require_any_authenticated, require_supervisor
 from schemas import (
     User,
     Reservation, ReservationStatus,
-    Locker, LockerStatus,
+    Locker, LockerStatus, LockerUpdate,
     AnomalyRecord, AnomalyType, AnomalyStatus, AnomalyRecordCreate,
     LockerOccupancyRate, OvertimeRankingItem,
 )
@@ -30,6 +30,10 @@ def run_anomaly_detection() -> List[AnomalyRecord]:
                 exists = db.list_anomaly_records(anomaly_type=AnomalyType.NO_SHOW)
                 already = [a for a in exists if a.reservation_id == res.id and a.status != AnomalyStatus.RESOLVED]
                 if not already:
+                    res.status = ReservationStatus.NO_SHOW
+                    locker = db.get_locker(res.locker_id)
+                    if locker and locker.status == LockerStatus.RESERVED:
+                        db.update_locker(res.locker_id, LockerUpdate(status=LockerStatus.AVAILABLE))
                     anomaly = db.create_anomaly_record(AnomalyRecordCreate(
                         type=AnomalyType.NO_SHOW,
                         reservation_id=res.id,

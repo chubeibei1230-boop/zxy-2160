@@ -11,6 +11,7 @@ from schemas import (
     UsageRule, UsageRuleUpdate,
     DisableReason, DisableReasonCreate,
     MessageResponse,
+    Reservation,
 )
 from database import db
 
@@ -174,3 +175,21 @@ def resolve_disable_reason(dr_id: str, current_user: User = Depends(require_admi
         if locker and locker.status == LockerStatus.DISABLED:
             db.update_locker(dr.locker_id, LockerUpdate(status=LockerStatus.AVAILABLE))
     return dr
+
+
+@router.put("/reservations/{res_id}/force-time", response_model=Reservation)
+def force_reservation_time(
+    res_id: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    _: User = Depends(require_admin),
+):
+    from datetime import datetime
+    res = db.get_reservation(res_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    if start_time:
+        res.start_time = datetime.fromisoformat(start_time)
+    if end_time:
+        res.end_time = datetime.fromisoformat(end_time)
+    return res
