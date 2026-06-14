@@ -1368,40 +1368,66 @@ class InMemoryDB:
         if user_records:
             profile.last_violation_at = max(c.created_at for c in user_records)
 
+        risk_order = {
+            RiskLevel.NORMAL: 0,
+            RiskLevel.LOW_RISK: 1,
+            RiskLevel.MEDIUM_RISK: 2,
+            RiskLevel.HIGH_RISK: 3,
+            RiskLevel.RESTRICTED: 4,
+        }
+
+        was_manually_restricted = (
+            profile.is_restricted
+            and profile.restriction_reason
+            and ("人工设置限制" in profile.restriction_reason)
+        )
+
         max_risk = RiskLevel.NORMAL
         restriction_rule = None
         for vt, rule in active_rules.items():
             count = profile.violation_counts.get(vt.value, 0)
             if count >= rule.restricted_threshold:
-                if max_risk != RiskLevel.RESTRICTED:
+                if risk_order.get(max_risk, 0) < risk_order.get(RiskLevel.RESTRICTED, 0):
                     max_risk = RiskLevel.RESTRICTED
                     restriction_rule = rule
             elif count >= rule.high_risk_threshold:
-                if max_risk.value < RiskLevel.HIGH_RISK.value:
+                if risk_order.get(max_risk, 0) < risk_order.get(RiskLevel.HIGH_RISK, 0):
                     max_risk = RiskLevel.HIGH_RISK
             elif count >= rule.medium_risk_threshold:
-                if max_risk.value < RiskLevel.MEDIUM_RISK.value:
+                if risk_order.get(max_risk, 0) < risk_order.get(RiskLevel.MEDIUM_RISK, 0):
                     max_risk = RiskLevel.MEDIUM_RISK
             elif count >= rule.low_risk_threshold:
-                if max_risk.value < RiskLevel.LOW_RISK.value:
+                if risk_order.get(max_risk, 0) < risk_order.get(RiskLevel.LOW_RISK, 0):
                     max_risk = RiskLevel.LOW_RISK
 
-        if profile.manually_lifted and max_risk == RiskLevel.RESTRICTED:
+        if was_manually_restricted and profile.restriction_until and profile.restriction_until > now:
+            max_risk = RiskLevel.RESTRICTED
+
+        if profile.manually_lifted and not was_manually_restricted and max_risk == RiskLevel.RESTRICTED:
             max_risk = RiskLevel.HIGH_RISK
 
         profile.risk_level = max_risk
 
-        if max_risk == RiskLevel.RESTRICTED and restriction_rule:
+        if max_risk == RiskLevel.RESTRICTED and restriction_rule and not was_manually_restricted:
             profile.is_restricted = True
             if not profile.restriction_until or profile.restriction_until < now:
                 profile.restriction_until = now + timedelta(days=restriction_rule.restriction_days)
                 profile.restriction_reason = f"违规次数达到限制阈值（{restriction_rule.name}）"
+        elif was_manually_restricted:
+            profile.is_restricted = True
+            if not (profile.restriction_until and profile.restriction_until > now):
+                profile.is_restricted = False
+                profile.restriction_until = None
+                profile.restriction_reason = None
         elif profile.restriction_until and profile.restriction_until < now:
             profile.is_restricted = False
             profile.restriction_until = None
             profile.restriction_reason = None
+            profile.manually_lifted = False
         else:
             profile.is_restricted = max_risk == RiskLevel.RESTRICTED
+            if not profile.is_restricted:
+                profile.manually_lifted = False
 
         profile.last_updated = now
         return profile
@@ -1434,6 +1460,9 @@ class InMemoryDB:
             warning_message = f"该使用人信用风险等级为中风险，共有{profile.total_violations}次违规记录"
         elif profile.risk_level == RiskLevel.LOW_RISK:
             warning_message = f"该使用人信用风险等级为低风险，共有{profile.total_violations}次违规记录"
+
+        if profile.is_restricted and profile.restriction_until and profile.restriction_until > now:
+            can_reserve = False
 
         recent_cutoff = now - timedelta(days=30)
         recent_violations = [

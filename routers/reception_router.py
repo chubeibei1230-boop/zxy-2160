@@ -7,7 +7,7 @@ from auth import require_reception
 from schemas import (
     User,
     Reservation, ReservationCreate, ReservationUpdate, ReservationStatus,
-    LockerStatus,
+    LockerStatus, LockerUpdate,
     MessageResponse,
     AnomalyRecord, AnomalyRecordCreate, AnomalyRecordUpdate, AnomalyType, AnomalyStatus,
     ReservationFulfillmentDetail,
@@ -266,7 +266,9 @@ def raise_anomaly_for_reservation(
         supplementary_notes=supplementary_notes,
         reporter=current_user.username,
     )
-    return db.create_anomaly_record(data)
+    anomaly = db.create_anomaly_record(data)
+    db.record_violation_from_anomaly(anomaly)
+    return anomaly
 
 
 @router.get("/reservations/{res_id}/anomalies", response_model=List[AnomalyRecord])
