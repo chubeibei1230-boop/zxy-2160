@@ -1,4 +1,7 @@
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,12 +11,33 @@ from routers.auth_router import router as auth_router
 from routers.admin_router import router as admin_router
 from routers.reception_router import router as reception_router
 from routers.supervisor_router import router as supervisor_router
-from routers.stats_router import router as stats_router
+from routers.stats_router import router as stats_router, run_anomaly_detection
+
+anomaly_detection_task: Optional[asyncio.Task] = None
+
+
+async def anomaly_detection_loop():
+    while True:
+        try:
+            _ = run_anomaly_detection()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
+    global anomaly_detection_task
+    anomaly_detection_task = asyncio.create_task(anomaly_detection_loop())
+    try:
+        yield
+    finally:
+        if anomaly_detection_task and not anomaly_detection_task.done():
+            anomaly_detection_task.cancel()
+            try:
+                await anomaly_detection_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

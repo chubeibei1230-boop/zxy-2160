@@ -12,6 +12,8 @@ from schemas import (
     AnomalyRecord, AnomalyType, AnomalyStatus, AnomalyRecordCreate,
     LockerOccupancyRate, OvertimeRankingItem,
     AnomalyStatistics, ReservationFulfillmentDetail, LockerAvailabilityCheck,
+    ReservationWithFulfillment, AnomalyTypeDistribution, AreaAnomalySummary,
+    FulfillmentOverview, AnomalyRecordWithRelations,
 )
 from database import db
 from config import settings
@@ -274,3 +276,75 @@ def get_reservation_anomalies_public(res_id: str, _: User = Depends(require_any_
     if not res:
         raise HTTPException(status_code=404, detail="预约记录不存在")
     return db.get_anomalies_for_reservation(res_id)
+
+
+@router.get("/reservations-with-fulfillment", response_model=List[ReservationWithFulfillment])
+def list_reservations_with_fulfillment_public(
+    area_id: Optional[str] = None,
+    locker_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+    status_filter: Optional[ReservationStatus] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    is_overtime: Optional[bool] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_reservations_with_fulfillment(
+        area_id=area_id, locker_id=locker_id, user_name=user_name,
+        status=status_filter, start_date=sd, end_date=ed, is_overtime=is_overtime,
+    )
+
+
+@router.get("/anomalies-with-relations", response_model=List[AnomalyRecordWithRelations])
+def query_anomalies_with_relations_public(
+    status_filter: Optional[AnomalyStatus] = None,
+    anomaly_type: Optional[AnomalyType] = None,
+    area_id: Optional[str] = None,
+    reservation_id: Optional[str] = None,
+    locker_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_anomaly_with_relations(
+        status=status_filter,
+        anomaly_type=anomaly_type,
+        area_id=area_id,
+        reservation_id=reservation_id,
+        locker_id=locker_id,
+        start_date=sd,
+        end_date=ed,
+    )
+
+
+@router.get("/stats/anomaly-overview-enhanced", response_model=AnomalyStatistics)
+def get_anomaly_statistics_enhanced_public(
+    area_id: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    return db.get_anomaly_statistics(area_id=area_id)
+
+
+@router.get("/stats/anomaly-type-distribution", response_model=List[AnomalyTypeDistribution])
+def get_anomaly_type_distribution_public(
+    area_id: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    return db.get_anomaly_type_distribution(area_id=area_id)
+
+
+@router.get("/stats/area-anomaly-summary", response_model=List[AreaAnomalySummary])
+def get_area_anomaly_summary_public(_: User = Depends(require_any_authenticated)):
+    return db.get_area_anomaly_summary()
+
+
+@router.get("/stats/fulfillment-overview", response_model=FulfillmentOverview)
+def get_fulfillment_overview_public(
+    area_id: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    return db.get_fulfillment_overview(area_id=area_id)

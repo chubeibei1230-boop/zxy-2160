@@ -309,16 +309,36 @@ class FulfillmentStep(BaseModel):
     completed_at: Optional[datetime] = None
     operator: Optional[str] = None
     remarks: Optional[str] = None
+    deadline_at: Optional[datetime] = None
+    remaining_seconds: Optional[int] = None
+    is_warning: bool = False
+    is_overdue: bool = False
+
+
+class ReservationFulfillmentSummary(BaseModel):
+    current_stage: str
+    current_stage_label: str
+    next_action: Optional[str] = None
+    next_action_label: Optional[str] = None
+    time_left_seconds: Optional[int] = None
+    time_left_text: Optional[str] = None
+    has_active_anomaly: bool = False
+    active_anomaly_count: int = 0
 
 
 class ReservationFulfillmentDetail(BaseModel):
     reservation: Reservation
     locker: Locker
+    area: Optional[Area] = None
     fulfillment_steps: List[FulfillmentStep]
     anomalies: List[AnomalyRecord]
+    fulfillment_summary: ReservationFulfillmentSummary
     can_raise_anomaly: bool
     can_release: bool
     can_confirm_release: bool
+    can_check_in: bool
+    can_cancel: bool
+    available_actions: List[Dict] = []
 
 
 class AnomalySupplement(BaseModel):
@@ -331,15 +351,41 @@ class AnomalyRecordUpdate(BaseModel):
     description: Optional[str] = None
 
 
+class AnomalyResolveData(BaseModel):
+    review_notes: Optional[str] = None
+    handling_notes: Optional[str] = None
+
+
+class LockerAnomalyImpact(BaseModel):
+    locker_id: str
+    locker_number: str
+    current_status: LockerStatus
+    area_id: Optional[str] = None
+    area_name: Optional[str] = None
+    unresolved_anomaly_count: int = 0
+    unresolved_anomalies: List[AnomalyRecord] = []
+    pending_disable_reason_count: int = 0
+    pending_disable_reasons: List[DisableReason] = []
+    active_reservation_count: int = 0
+    active_reservations: List[Reservation] = []
+    can_reserve: bool = True
+    can_disable: bool = True
+    can_restore: bool = True
+    impact_reasons: List[str] = []
+
+
 class LockerAvailabilityCheck(BaseModel):
     locker_id: str
     locker_number: str
     current_status: LockerStatus
     can_reserve: bool
     can_restore: bool
+    can_disable: bool = True
     blocking_reasons: List[str]
     unresolved_disable_reasons: List[DisableReason]
     active_reservations: List[Reservation]
+    unresolved_anomalies: List[AnomalyRecord] = []
+    anomaly_impact: Optional[LockerAnomalyImpact] = None
 
 
 class AnomalyStatistics(BaseModel):
@@ -349,12 +395,65 @@ class AnomalyStatistics(BaseModel):
     resolved: int
     rejected: int
     by_type: Dict[str, int]
+    by_area: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    today_new: int = 0
+    resolved_today: int = 0
+    avg_resolve_minutes: Optional[float] = None
 
 
 class AnomalyListQuery(BaseModel):
     status: Optional[AnomalyStatus] = None
     anomaly_type: Optional[AnomalyType] = None
+    area_id: Optional[str] = None
     reservation_id: Optional[str] = None
     locker_id: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+
+
+class ReservationWithFulfillment(Reservation):
+    locker_number: Optional[str] = None
+    area_id: Optional[str] = None
+    area_name: Optional[str] = None
+    fulfillment_summary: Optional[ReservationFulfillmentSummary] = None
+    anomaly_count: int = 0
+
+
+class AnomalyRecordWithRelations(AnomalyRecord):
+    reservation: Optional[Reservation] = None
+    locker: Optional[Locker] = None
+    area: Optional[Area] = None
+    locker_number: Optional[str] = None
+    area_name: Optional[str] = None
+    user_name: Optional[str] = None
+
+
+class AnomalyTypeDistribution(BaseModel):
+    type: AnomalyType
+    label: str
+    count: int
+    percentage: float
+
+
+class AreaAnomalySummary(BaseModel):
+    area_id: str
+    area_name: str
+    total: int = 0
+    pending: int = 0
+    confirmed: int = 0
+    resolved: int = 0
+    rejected: int = 0
+
+
+class FulfillmentOverview(BaseModel):
+    total_reservations: int = 0
+    stage_reserved: int = 0
+    stage_checked_in: int = 0
+    stage_released: int = 0
+    stage_completed: int = 0
+    stage_cancelled: int = 0
+    stage_no_show: int = 0
+    stage_overtime: int = 0
+    warning_count: int = 0
+    overdue_count: int = 0

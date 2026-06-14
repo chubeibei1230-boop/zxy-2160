@@ -11,6 +11,7 @@ from schemas import (
     MessageResponse,
     AnomalyRecord, AnomalyRecordCreate, AnomalyRecordUpdate, AnomalyType, AnomalyStatus,
     ReservationFulfillmentDetail,
+    ReservationWithFulfillment,
 )
 from database import db
 from config import settings
@@ -39,68 +40,6 @@ def _validate_time_slot(start_time: datetime, end_time: datetime):
             status_code=400,
             detail=f"预约时间不在可预约时段内，可用时段: {slot_desc}",
         )
-
-
-@router.post("/reservations", response_model=Reservation, status_code=status.HTTP_201_CREATED)
-def create_reservation(data: ReservationCreate, current_user: User = Depends(require_reception)):
-    if data.start_time >= data.end_time:
-        raise HTTPException(status_code=400, detail="预约开始时间必须早于结束时间")
-    if data.start_time < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="预约开始时间不能早于当前时间")
-
-    duration_hours = (data.end_time - data.start_time).total_seconds() / 3600
-    rule = db.get_usage_rule()
-    if duration_hours > rule.max_hours_per_reservation:
-        raise HTTPException(
-            status_code=400,
-            detail=f"单次预约时长不能超过 {rule.max_hours_per_reservation} 小时"
-        )
-
-    locker = db.get_locker(data.locker_id)
-    if not locker:
-        raise HTTPException(status_code=404, detail="储物格不存在")
-    if locker.status == LockerStatus.DISABLED:
-        raise HTTPException(status_code=400, detail="该储物格已停用，无法预约")
-    if locker.status == LockerStatus.PENDING_RELEASE:
-        raise HTTPException(status_code=400, detail="该储物格待确认释放，暂不可预约")
-    if locker.status != LockerStatus.AVAILABLE:
-        status_label = {
-            LockerStatus.RESERVED: "已被预约",
-            LockerStatus.IN_USE: "使用中",
-            LockerStatus.PENDING_RELEASE: "待确认释放",
-            LockerStatus.DISABLED: "已停用",
-        }.get(locker.status, locker.status)
-        raise HTTPException(status_code=400, detail=f"该储物格当前状态为{status_label}，无法预约")
-
-    locker_active = db.get_active_reservations_for_locker(data.locker_id)
-    for exist in locker_active:
-        if _check_time_overlap(data.start_time, data.end_time, exist.start_time, exist.end_time):
-            raise HTTPException(
-                status_code=409,
-                detail=f"该储物格在 {exist.start_time} 至 {exist.end_time} 已被预约，时间重叠"
-            )
-
-    user_active = db.get_active_reservations_for_user(data.user_id_number)
-    for exist in user_active:
-        if _check_time_overlap(data.start_time, data.end_time, exist.start_time, exist.end_time):
-            raise HTTPException(
-                status_code=409,
-                detail=f"该使用人在 {exist.start_time} 至 {exist.end_time} 已有预约（储物格: {exist.locker_id}），时间重叠"
-            )
-
-    same_day_reservations = [
-        r for r in user_active
-        if r.start_time.date() == data.start_time.date()
-    ]
-    if len(same_day_reservations) >= rule.max_reservations_per_user_per_day:
-        raise HTTPException(
-            status_code=400,
-            detail=f"该使用人当日预约数已达上限（{rule.max_reservations_per_user_per_day}次）"
-        )
-
-    _validate_time_slot(data.start_time, data.end_time)
-
-    return db.create_reservation(data, created_by=current_user.username)
 
 
 @router.get("/reservations", response_model=List[Reservation])
@@ -351,6 +290,100 @@ def get_anomaly_detail(record_id: str, _: User = Depends(require_reception)):
 def list_anomalies(
     status_filter: Optional[AnomalyStatus] = None,
     anomaly_type: Optional[AnomalyType] = None,
+    area_id: Optional[str] = None,
     _: User = Depends(require_reception),
 ):
-    return db.list_anomaly_records(status=status_filter, anomaly_type=anomaly_type)
+    return db.list_anomaly_records_enhanced(
+        status=status_filter, anomaly_type=anomaly_type, area_id=area_id,
+    )
+
+
+@router.get("/reservations-with-fulfillment", response_model=List[ReservationWithFulfillment])
+def list_reservations_with_fulfillment(
+    area_id: Optional[str] = None,
+    locker_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+    status_filter: Optional[ReservationStatus] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    is_overtime: Optional[bool] = None,
+    _: User = Depends(require_reception),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_reservations_with_fulfillment(
+        area_id=area_id, locker_id=locker_id, user_name=user_name,
+        status=status_filter, start_date=sd, end_date=ed, is_overtime=is_overtime,
+    )
+
+
+@router.get("/anomaly-types", response_model=List[dict])
+def list_anomaly_types(_: User = Depends(require_reception)):
+    type_labels = {
+        AnomalyType.NO_SHOW: "超时未签到",
+        AnomalyType.OVERTIME: "超时未释放",
+        AnomalyType.DISABLED_LOCKER_RESERVED: "停用储物格仍被占用",
+        AnomalyType.RELEASE_CONFIRM_MISSING: "释放后未确认",
+        AnomalyType.ABNORMAL_OCCUPANCY: "异常占用",
+    }
+    return [
+        {"value": t.value, "label": type_labels.get(t, t.value)}
+        for t in AnomalyType
+    ]
+
+
+@router.post("/reservations", response_model=Reservation, status_code=status.HTTP_201_CREATED)
+def create_reservation(data: ReservationCreate, current_user: User = Depends(require_reception)):
+    if data.start_time >= data.end_time:
+        raise HTTPException(status_code=400, detail="预约开始时间必须早于结束时间")
+    if data.start_time < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="预约开始时间不能早于当前时间")
+
+    duration_hours = (data.end_time - data.start_time).total_seconds() / 3600
+    rule = db.get_usage_rule()
+    if duration_hours > rule.max_hours_per_reservation:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次预约时长不能超过 {rule.max_hours_per_reservation} 小时"
+        )
+
+    locker = db.get_locker(data.locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+
+    check = db.check_locker_availability(data.locker_id)
+    if not check:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if not check.can_reserve:
+        reasons = "; ".join(check.blocking_reasons)
+        raise HTTPException(status_code=400, detail=f"储物格不可预约: {reasons}")
+
+    locker_active = db.get_active_reservations_for_locker(data.locker_id)
+    for exist in locker_active:
+        if _check_time_overlap(data.start_time, data.end_time, exist.start_time, exist.end_time):
+            raise HTTPException(
+                status_code=409,
+                detail=f"该储物格在 {exist.start_time} 至 {exist.end_time} 已被预约，时间重叠"
+            )
+
+    user_active = db.get_active_reservations_for_user(data.user_id_number)
+    for exist in user_active:
+        if _check_time_overlap(data.start_time, data.end_time, exist.start_time, exist.end_time):
+            raise HTTPException(
+                status_code=409,
+                detail=f"该使用人在 {exist.start_time} 至 {exist.end_time} 已有预约（储物格: {exist.locker_id}），时间重叠"
+            )
+
+    same_day_reservations = [
+        r for r in user_active
+        if r.start_time.date() == data.start_time.date()
+    ]
+    if len(same_day_reservations) >= rule.max_reservations_per_user_per_day:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该使用人当日预约数已达上限（{rule.max_reservations_per_user_per_day}次）"
+        )
+
+    _validate_time_slot(data.start_time, data.end_time)
+
+    return db.create_reservation(data, created_by=current_user.username)

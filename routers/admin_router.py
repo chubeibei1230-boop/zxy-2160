@@ -12,7 +12,8 @@ from schemas import (
     DisableReason, DisableReasonCreate,
     MessageResponse,
     Reservation, ReservationStatus,
-    LockerAvailabilityCheck,
+    LockerAvailabilityCheck, LockerAnomalyImpact,
+    AnomalyRecord,
 )
 from database import db
 
@@ -145,25 +146,6 @@ def update_usage_rule(data: UsageRuleUpdate, _: User = Depends(require_admin)):
     return db.update_usage_rule(data)
 
 
-@router.post("/disable-reasons", response_model=DisableReason, status_code=status.HTTP_201_CREATED)
-def create_disable_reason(data: DisableReasonCreate, current_user: User = Depends(require_admin)):
-    locker = db.get_locker(data.locker_id)
-    if not locker:
-        raise HTTPException(status_code=400, detail="储物格不存在")
-    if locker.status == LockerStatus.DISABLED:
-        raise HTTPException(status_code=400, detail="该储物格已处于停用状态")
-    active_reservations = db.get_active_reservations_for_locker(data.locker_id)
-    if active_reservations:
-        raise HTTPException(
-            status_code=400,
-            detail=f"该储物格存在 {len(active_reservations)} 个未完成预约，无法停用",
-        )
-    data.reporter = current_user.username
-    dr = db.create_disable_reason(data)
-    db.update_locker(data.locker_id, LockerUpdate(status=LockerStatus.DISABLED))
-    return dr
-
-
 @router.get("/disable-reasons", response_model=List[DisableReason])
 def list_disable_reasons(
     locker_id: Optional[str] = None,
@@ -208,6 +190,71 @@ def check_locker_availability(locker_id: str, _: User = Depends(require_admin)):
     return check
 
 
+@router.get("/lockers/{locker_id}/active-reservations", response_model=List[Reservation])
+def list_locker_active_reservations(locker_id: str, _: User = Depends(require_admin)):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    return db.get_active_reservations_for_locker(locker_id)
+
+
+@router.get("/lockers/with-status", response_model=List[Locker])
+def list_lockers_with_status_check(
+    area_id: Optional[str] = None,
+    status_filter: Optional[LockerStatus] = None,
+    _: User = Depends(require_admin),
+):
+    lockers = db.list_lockers(area_id=area_id, status=status_filter)
+    return lockers
+
+
+@router.get("/lockers/{locker_id}/anomaly-impact", response_model=LockerAnomalyImpact)
+def get_locker_anomaly_impact(
+    locker_id: str,
+    _: User = Depends(require_admin),
+):
+    impact = db.get_locker_anomaly_impact(locker_id)
+    if not impact:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    return impact
+
+
+@router.get("/lockers/{locker_id}/anomalies", response_model=List[AnomalyRecord])
+def list_locker_anomalies(
+    locker_id: str,
+    unresolved_only: bool = True,
+    _: User = Depends(require_admin),
+):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if unresolved_only:
+        return db.get_unresolved_anomalies_for_locker(locker_id)
+    return [a for a in db.anomaly_records.values() if a.locker_id == locker_id]
+
+
+@router.post("/disable-reasons", response_model=DisableReason, status_code=status.HTTP_201_CREATED)
+def create_disable_reason(data: DisableReasonCreate, current_user: User = Depends(require_admin)):
+    locker = db.get_locker(data.locker_id)
+    if not locker:
+        raise HTTPException(status_code=400, detail="储物格不存在")
+    if locker.status == LockerStatus.DISABLED:
+        raise HTTPException(status_code=400, detail="该储物格已处于停用状态")
+    check = db.check_locker_availability(data.locker_id)
+    if not check:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if not check.can_disable:
+        reasons = "; ".join(check.blocking_reasons)
+        raise HTTPException(
+            status_code=400,
+            detail=f"无法停用储物格: {reasons}",
+        )
+    data.reporter = current_user.username
+    dr = db.create_disable_reason(data)
+    db.update_locker(data.locker_id, LockerUpdate(status=LockerStatus.DISABLED))
+    return dr
+
+
 @router.post("/lockers/{locker_id}/disable", response_model=DisableReason, status_code=status.HTTP_201_CREATED)
 def disable_locker_with_check(
     locker_id: str,
@@ -219,11 +266,14 @@ def disable_locker_with_check(
         raise HTTPException(status_code=404, detail="储物格不存在")
     if locker.status == LockerStatus.DISABLED:
         raise HTTPException(status_code=400, detail="该储物格已处于停用状态")
-    active_reservations = db.get_active_reservations_for_locker(locker_id)
-    if active_reservations:
+    check = db.check_locker_availability(locker_id)
+    if not check:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if not check.can_disable:
+        reasons = "; ".join(check.blocking_reasons)
         raise HTTPException(
             status_code=400,
-            detail=f"该储物格存在 {len(active_reservations)} 个未完成预约，无法停用",
+            detail=f"无法停用储物格: {reasons}",
         )
     data.locker_id = locker_id
     data.reporter = current_user.username
@@ -247,21 +297,3 @@ def restore_locker_with_check(locker_id: str, _: User = Depends(require_admin)):
     if not restored:
         raise HTTPException(status_code=500, detail="恢复储物格失败")
     return restored
-
-
-@router.get("/lockers/{locker_id}/active-reservations", response_model=List[Reservation])
-def list_locker_active_reservations(locker_id: str, _: User = Depends(require_admin)):
-    locker = db.get_locker(locker_id)
-    if not locker:
-        raise HTTPException(status_code=404, detail="储物格不存在")
-    return db.get_active_reservations_for_locker(locker_id)
-
-
-@router.get("/lockers/with-status", response_model=List[Locker])
-def list_lockers_with_status_check(
-    area_id: Optional[str] = None,
-    status_filter: Optional[LockerStatus] = None,
-    _: User = Depends(require_admin),
-):
-    lockers = db.list_lockers(area_id=area_id, status=status_filter)
-    return lockers

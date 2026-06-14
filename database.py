@@ -14,6 +14,10 @@ from schemas import (
     CheckInRecord, ReleaseRecord,
     AnomalyRecord, AnomalyRecordCreate, AnomalyRecordUpdate, AnomalyReview, AnomalyType, AnomalyStatus,
     FulfillmentStep, ReservationFulfillmentDetail, LockerAvailabilityCheck, AnomalyStatistics,
+    ReservationFulfillmentSummary, LockerAnomalyImpact,
+    ReservationWithFulfillment, AnomalyRecordWithRelations,
+    AnomalyTypeDistribution, AreaAnomalySummary, FulfillmentOverview,
+    AnomalyResolveData,
 )
 from config import settings
 
@@ -508,6 +512,132 @@ class InMemoryDB:
     def get_anomalies_for_reservation(self, reservation_id: str) -> List[AnomalyRecord]:
         return [a for a in self.anomaly_records.values() if a.reservation_id == reservation_id]
 
+    def _format_remaining(self, seconds: Optional[int]) -> Optional[str]:
+        if seconds is None or seconds < 0:
+            return None
+        if seconds >= 86400:
+            days = seconds // 86400
+            hours = (seconds % 86400) // 3600
+            return f"{days}天{hours}小时" if hours > 0 else f"{days}天"
+        elif seconds >= 3600:
+            hours = seconds // 3600
+            mins = (seconds % 3600) // 60
+            return f"{hours}小时{mins}分钟" if mins > 0 else f"{hours}小时"
+        else:
+            mins = seconds // 60
+            secs = seconds % 60
+            return f"{mins}分{secs}秒" if secs > 0 else f"{mins}分钟"
+
+    def _compute_fulfillment_summary(
+        self,
+        res: Reservation,
+        locker: Locker,
+        anomalies: List[AnomalyRecord],
+    ) -> ReservationFulfillmentSummary:
+        now = datetime.utcnow()
+        current_stage = "reserved"
+        current_stage_label = "已预约"
+        next_action = None
+        next_action_label = None
+        time_left_seconds: Optional[int] = None
+
+        active_anomalies = [a for a in anomalies if a.status in {AnomalyStatus.PENDING, AnomalyStatus.CONFIRMED}]
+
+        if res.status == ReservationStatus.CANCELLED:
+            current_stage = "cancelled"
+            current_stage_label = "已取消"
+        elif res.status == ReservationStatus.NO_SHOW:
+            current_stage = "no_show"
+            current_stage_label = "未签到"
+        elif res.status == ReservationStatus.RESERVED:
+            current_stage = "reserved"
+            current_stage_label = "待签到"
+            next_action = "check_in"
+            next_action_label = "签到"
+            deadline = res.start_time + timedelta(minutes=settings.auto_checkin_timeout_minutes)
+            delta = int((deadline - now).total_seconds())
+            time_left_seconds = delta
+        elif res.status == ReservationStatus.CHECKED_IN:
+            current_stage = "checked_in"
+            current_stage_label = "使用中"
+            next_action = "release"
+            next_action_label = "释放储物格"
+            delta = int((res.end_time - now).total_seconds())
+            time_left_seconds = delta
+        elif res.status == ReservationStatus.OVERTIME:
+            current_stage = "overtime"
+            current_stage_label = "超时使用"
+            next_action = "release"
+            next_action_label = "释放储物格"
+            delta = int((res.end_time - now).total_seconds())
+            time_left_seconds = delta
+        elif res.status == ReservationStatus.RELEASED:
+            if locker.status == LockerStatus.PENDING_RELEASE:
+                current_stage = "pending_confirm"
+                current_stage_label = "待确认释放"
+                next_action = "confirm_release"
+                next_action_label = "确认释放"
+                if res.release:
+                    deadline = res.release.release_time + timedelta(hours=1)
+                    delta = int((deadline - now).total_seconds())
+                    time_left_seconds = delta
+            else:
+                current_stage = "completed"
+                current_stage_label = "已完成"
+
+        return ReservationFulfillmentSummary(
+            current_stage=current_stage,
+            current_stage_label=current_stage_label,
+            next_action=next_action,
+            next_action_label=next_action_label,
+            time_left_seconds=time_left_seconds if time_left_seconds is not None and time_left_seconds > 0 else None,
+            time_left_text=self._format_remaining(time_left_seconds if time_left_seconds and time_left_seconds > 0 else None),
+            has_active_anomaly=len(active_anomalies) > 0,
+            active_anomaly_count=len(active_anomalies),
+        )
+
+    def _enrich_fulfillment_steps(
+        self,
+        res: Reservation,
+        locker: Locker,
+        steps: List[FulfillmentStep],
+    ) -> List[FulfillmentStep]:
+        now = datetime.utcnow()
+        enriched: List[FulfillmentStep] = []
+        for s in steps:
+            deadline: Optional[datetime] = None
+            remaining: Optional[int] = None
+            is_warning = False
+            is_overdue = False
+
+            if s.step == "check_in" and s.status == "pending":
+                deadline = res.start_time + timedelta(minutes=settings.auto_checkin_timeout_minutes)
+            elif s.step == "release" and s.status == "pending":
+                deadline = res.end_time
+            elif s.step == "confirm_release" and s.status == "pending" and res.release:
+                deadline = res.release.release_time + timedelta(hours=1)
+
+            if deadline and s.status == "pending":
+                remaining = int((deadline - now).total_seconds())
+                if remaining < 0:
+                    is_overdue = True
+                elif remaining <= 600:
+                    is_warning = True
+
+            enriched.append(FulfillmentStep(
+                step=s.step,
+                label=s.label,
+                status=s.status,
+                completed_at=s.completed_at,
+                operator=s.operator,
+                remarks=s.remarks,
+                deadline_at=deadline,
+                remaining_seconds=remaining if remaining is not None and remaining >= 0 else None,
+                is_warning=is_warning,
+                is_overdue=is_overdue,
+            ))
+        return enriched
+
     def get_reservation_fulfillment_detail(self, res_id: str) -> Optional[ReservationFulfillmentDetail]:
         res = self.get_reservation(res_id)
         if not res:
@@ -516,9 +646,11 @@ class InMemoryDB:
         if not locker:
             return None
 
-        steps: List[FulfillmentStep] = []
+        area = self.get_area(locker.area_id)
 
-        steps.append(FulfillmentStep(
+        raw_steps: List[FulfillmentStep] = []
+
+        raw_steps.append(FulfillmentStep(
             step="create",
             label="创建预约",
             status="completed",
@@ -527,7 +659,7 @@ class InMemoryDB:
         ))
 
         if res.check_in:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="check_in",
                 label="签到",
                 status="completed",
@@ -536,20 +668,20 @@ class InMemoryDB:
                 remarks=res.check_in.remarks,
             ))
         elif res.status in {ReservationStatus.CANCELLED, ReservationStatus.NO_SHOW}:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="check_in",
                 label="签到",
                 status="skipped" if res.status == ReservationStatus.CANCELLED else "failed",
             ))
         else:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="check_in",
                 label="签到",
                 status="pending",
             ))
 
         if res.release:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="release",
                 label="释放储物格",
                 status="completed",
@@ -558,42 +690,44 @@ class InMemoryDB:
                 remarks=res.release.remarks,
             ))
         elif res.status in {ReservationStatus.CANCELLED, ReservationStatus.NO_SHOW}:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="release",
                 label="释放储物格",
                 status="skipped",
             ))
         else:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="release",
                 label="释放储物格",
                 status="pending",
             ))
 
         if res.release and locker.status == LockerStatus.AVAILABLE:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="confirm_release",
                 label="确认释放",
                 status="completed",
             ))
         elif res.release and locker.status == LockerStatus.PENDING_RELEASE:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="confirm_release",
                 label="确认释放",
                 status="pending",
             ))
         elif res.status in {ReservationStatus.CANCELLED, ReservationStatus.NO_SHOW}:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="confirm_release",
                 label="确认释放",
                 status="skipped",
             ))
         else:
-            steps.append(FulfillmentStep(
+            raw_steps.append(FulfillmentStep(
                 step="confirm_release",
                 label="确认释放",
                 status="pending",
             ))
+
+        steps = self._enrich_fulfillment_steps(res, locker, raw_steps)
 
         anomalies = self.get_anomalies_for_reservation(res_id)
 
@@ -605,6 +739,8 @@ class InMemoryDB:
         }
 
         can_release = res.status in {ReservationStatus.CHECKED_IN, ReservationStatus.OVERTIME}
+        can_check_in = res.status == ReservationStatus.RESERVED
+        can_cancel = res.status == ReservationStatus.RESERVED
 
         can_confirm_release = (
             res.status in {ReservationStatus.RELEASED, ReservationStatus.OVERTIME}
@@ -612,14 +748,97 @@ class InMemoryDB:
             and locker.status == LockerStatus.PENDING_RELEASE
         )
 
+        available_actions: List[Dict] = []
+        if can_check_in:
+            available_actions.append({"action": "check_in", "label": "签到", "priority": 1})
+        if can_release:
+            available_actions.append({"action": "release", "label": "释放储物格", "priority": 2})
+        if can_confirm_release:
+            available_actions.append({"action": "confirm_release", "label": "确认释放", "priority": 3})
+        if can_cancel:
+            available_actions.append({"action": "cancel", "label": "取消预约", "priority": 4})
+        if can_raise_anomaly:
+            available_actions.append({"action": "raise_anomaly", "label": "发起异常", "priority": 5})
+
+        fulfillment_summary = self._compute_fulfillment_summary(res, locker, anomalies)
+
         return ReservationFulfillmentDetail(
             reservation=res,
             locker=locker,
+            area=area,
             fulfillment_steps=steps,
             anomalies=anomalies,
+            fulfillment_summary=fulfillment_summary,
             can_raise_anomaly=can_raise_anomaly,
             can_release=can_release,
             can_confirm_release=can_confirm_release,
+            can_check_in=can_check_in,
+            can_cancel=can_cancel,
+            available_actions=available_actions,
+        )
+
+    def get_unresolved_anomalies_for_locker(self, locker_id: str) -> List[AnomalyRecord]:
+        return [
+            a for a in self.anomaly_records.values()
+            if a.locker_id == locker_id and a.status in {AnomalyStatus.PENDING, AnomalyStatus.CONFIRMED}
+        ]
+
+    def get_locker_anomaly_impact(self, locker_id: str) -> Optional[LockerAnomalyImpact]:
+        locker = self.get_locker(locker_id)
+        if not locker:
+            return None
+
+        area = self.get_area(locker.area_id)
+        unresolved_anomalies = self.get_unresolved_anomalies_for_locker(locker_id)
+        pending_disable_reasons = self.list_disable_reasons(locker_id=locker_id, resolved=False)
+        active_reservations = self.get_active_reservations_for_locker(locker_id)
+
+        can_reserve = True
+        can_disable = True
+        can_restore = True
+        impact_reasons: List[str] = []
+
+        if locker.status == LockerStatus.DISABLED:
+            can_reserve = False
+        else:
+            can_restore = False
+
+        if unresolved_anomalies:
+            can_reserve = False
+            can_disable = False
+            can_restore = False
+            impact_reasons.append(f"存在 {len(unresolved_anomalies)} 条未解决的异常记录")
+        if pending_disable_reasons:
+            can_reserve = False
+            can_restore = False
+            impact_reasons.append(f"存在 {len(pending_disable_reasons)} 条未处理的停用原因")
+        if active_reservations:
+            can_reserve = False
+            can_disable = False
+            can_restore = False
+            impact_reasons.append(f"存在 {len(active_reservations)} 个未完成的预约")
+
+        if locker.status in {LockerStatus.IN_USE, LockerStatus.RESERVED, LockerStatus.PENDING_RELEASE}:
+            can_reserve = False
+            if can_disable and locker.status != LockerStatus.RESERVED:
+                can_disable = False
+
+        return LockerAnomalyImpact(
+            locker_id=locker.id,
+            locker_number=locker.locker_number,
+            current_status=locker.status,
+            area_id=locker.area_id,
+            area_name=area.name if area else None,
+            unresolved_anomaly_count=len(unresolved_anomalies),
+            unresolved_anomalies=unresolved_anomalies,
+            pending_disable_reason_count=len(pending_disable_reasons),
+            pending_disable_reasons=pending_disable_reasons,
+            active_reservation_count=len(active_reservations),
+            active_reservations=active_reservations,
+            can_reserve=can_reserve,
+            can_disable=can_disable,
+            can_restore=can_restore,
+            impact_reasons=impact_reasons,
         )
 
     def check_locker_availability(self, locker_id: str) -> Optional[LockerAvailabilityCheck]:
@@ -630,13 +849,18 @@ class InMemoryDB:
         blocking_reasons: List[str] = []
         unresolved_disable_reasons = self.list_disable_reasons(locker_id=locker_id, resolved=False)
         active_reservations = self.get_active_reservations_for_locker(locker_id)
+        unresolved_anomalies = self.get_unresolved_anomalies_for_locker(locker_id)
+        anomaly_impact = self.get_locker_anomaly_impact(locker_id)
 
         can_reserve = True
         can_restore = True
+        can_disable = True
 
         if locker.status == LockerStatus.DISABLED:
             can_reserve = False
             blocking_reasons.append("储物格已停用")
+        else:
+            can_restore = False
 
         if unresolved_disable_reasons:
             can_reserve = False
@@ -646,7 +870,14 @@ class InMemoryDB:
         if active_reservations:
             can_reserve = False
             can_restore = False
+            can_disable = False
             blocking_reasons.append(f"存在 {len(active_reservations)} 个未完成的预约")
+
+        if unresolved_anomalies:
+            can_reserve = False
+            can_restore = False
+            can_disable = False
+            blocking_reasons.append(f"存在 {len(unresolved_anomalies)} 条未解决的异常记录")
 
         if locker.status in {LockerStatus.IN_USE, LockerStatus.RESERVED, LockerStatus.PENDING_RELEASE}:
             can_reserve = False
@@ -657,6 +888,8 @@ class InMemoryDB:
                     LockerStatus.PENDING_RELEASE: "待确认释放",
                 }.get(locker.status, locker.status)
                 blocking_reasons.append(f"储物格当前状态: {status_label}")
+            if locker.status != LockerStatus.RESERVED:
+                can_disable = False
 
         return LockerAvailabilityCheck(
             locker_id=locker.id,
@@ -664,15 +897,19 @@ class InMemoryDB:
             current_status=locker.status,
             can_reserve=can_reserve,
             can_restore=can_restore,
+            can_disable=can_disable,
             blocking_reasons=blocking_reasons,
             unresolved_disable_reasons=unresolved_disable_reasons,
             active_reservations=active_reservations,
+            unresolved_anomalies=unresolved_anomalies,
+            anomaly_impact=anomaly_impact,
         )
 
     def list_anomaly_records_enhanced(
         self,
         status: Optional[AnomalyStatus] = None,
         anomaly_type: Optional[AnomalyType] = None,
+        area_id: Optional[str] = None,
         reservation_id: Optional[str] = None,
         locker_id: Optional[str] = None,
         start_date: Optional[date] = None,
@@ -683,6 +920,19 @@ class InMemoryDB:
             result = [a for a in result if a.status == status]
         if anomaly_type:
             result = [a for a in result if a.type == anomaly_type]
+        if area_id:
+            filtered: List[AnomalyRecord] = []
+            for a in result:
+                target_locker_id = a.locker_id
+                if not target_locker_id and a.reservation_id:
+                    res = self.get_reservation(a.reservation_id)
+                    if res:
+                        target_locker_id = res.locker_id
+                if target_locker_id:
+                    locker = self.get_locker(target_locker_id)
+                    if locker and locker.area_id == area_id:
+                        filtered.append(a)
+            result = filtered
         if reservation_id:
             result = [a for a in result if a.reservation_id == reservation_id]
         if locker_id:
@@ -693,13 +943,77 @@ class InMemoryDB:
             result = [a for a in result if a.created_at.date() <= end_date]
         return result
 
-    def get_anomaly_statistics(self) -> AnomalyStatistics:
-        all_records = list(self.anomaly_records.values())
+    def list_anomaly_with_relations(
+        self,
+        status: Optional[AnomalyStatus] = None,
+        anomaly_type: Optional[AnomalyType] = None,
+        area_id: Optional[str] = None,
+        reservation_id: Optional[str] = None,
+        locker_id: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> List[AnomalyRecordWithRelations]:
+        records = self.list_anomaly_records_enhanced(
+            status=status, anomaly_type=anomaly_type, area_id=area_id,
+            reservation_id=reservation_id, locker_id=locker_id,
+            start_date=start_date, end_date=end_date,
+        )
+        enriched: List[AnomalyRecordWithRelations] = []
+        for a in records:
+            res = self.get_reservation(a.reservation_id) if a.reservation_id else None
+            target_locker_id = a.locker_id or (res.locker_id if res else None)
+            locker = self.get_locker(target_locker_id) if target_locker_id else None
+            area = self.get_area(locker.area_id) if locker else None
+            data = a.model_dump()
+            enriched.append(AnomalyRecordWithRelations(
+                **data,
+                reservation=res,
+                locker=locker,
+                area=area,
+                locker_number=locker.locker_number if locker else None,
+                area_name=area.name if area else None,
+                user_name=res.user_name if res else None,
+            ))
+        return enriched
+
+    def get_anomaly_statistics(self, area_id: Optional[str] = None) -> AnomalyStatistics:
+        all_records = self.list_anomaly_records_enhanced(area_id=area_id)
         by_type: Dict[str, int] = {}
         for t in AnomalyType:
             by_type[t.value] = 0
+        by_area: Dict[str, int] = {}
+        by_status: Dict[str, int] = {}
+        for s in AnomalyStatus:
+            by_status[s.value] = 0
+
+        today = date.today()
+        today_new = 0
+        resolved_today = 0
+        resolve_minutes_list: List[int] = []
+
         for a in all_records:
             by_type[a.type.value] = by_type.get(a.type.value, 0) + 1
+            by_status[a.status.value] = by_status.get(a.status.value, 0) + 1
+            target_locker_id = a.locker_id
+            if not target_locker_id and a.reservation_id:
+                res = self.get_reservation(a.reservation_id)
+                if res:
+                    target_locker_id = res.locker_id
+            if target_locker_id:
+                locker = self.get_locker(target_locker_id)
+                if locker:
+                    area_name = locker.area_id
+                    by_area[area_name] = by_area.get(area_name, 0) + 1
+            if a.created_at.date() == today:
+                today_new += 1
+            if a.status == AnomalyStatus.RESOLVED and a.reviewed_at:
+                if a.reviewed_at.date() == today:
+                    resolved_today += 1
+                delta = a.reviewed_at - a.created_at
+                resolve_minutes_list.append(int(delta.total_seconds() // 60))
+
+        avg_resolve = (sum(resolve_minutes_list) / len(resolve_minutes_list)) if resolve_minutes_list else None
+
         return AnomalyStatistics(
             total=len(all_records),
             pending=len([a for a in all_records if a.status == AnomalyStatus.PENDING]),
@@ -707,13 +1021,139 @@ class InMemoryDB:
             resolved=len([a for a in all_records if a.status == AnomalyStatus.RESOLVED]),
             rejected=len([a for a in all_records if a.status == AnomalyStatus.REJECTED]),
             by_type=by_type,
+            by_area=by_area,
+            by_status=by_status,
+            today_new=today_new,
+            resolved_today=resolved_today,
+            avg_resolve_minutes=round(avg_resolve, 1) if avg_resolve is not None else None,
         )
+
+    def get_anomaly_type_distribution(self, area_id: Optional[str] = None) -> List[AnomalyTypeDistribution]:
+        type_labels = {
+            AnomalyType.NO_SHOW: "未签到",
+            AnomalyType.OVERTIME: "超时使用",
+            AnomalyType.DISABLED_LOCKER_RESERVED: "停用储物格仍有预约",
+            AnomalyType.RELEASE_CONFIRM_MISSING: "释放未确认",
+            AnomalyType.ABNORMAL_OCCUPANCY: "异常占用",
+        }
+        records = self.list_anomaly_records_enhanced(area_id=area_id)
+        total = len(records)
+        counts: Dict[str, int] = {}
+        for t in AnomalyType:
+            counts[t.value] = 0
+        for a in records:
+            counts[a.type.value] = counts.get(a.type.value, 0) + 1
+
+        dist = []
+        for t in AnomalyType:
+            count = counts.get(t.value, 0)
+            pct = round(((count / total) * 100) if total > 0 else 0.0, 2)
+            dist.append(AnomalyTypeDistribution(
+                type=t,
+                label=type_labels.get(t, t.value),
+                count=count,
+                percentage=pct,
+            ))
+        return dist
+
+    def get_area_anomaly_summary(self) -> List[AreaAnomalySummary]:
+        areas = self.list_areas()
+        result = []
+        for area in areas:
+            records = self.list_anomaly_records_enhanced(area_id=area.id)
+            result.append(AreaAnomalySummary(
+                area_id=area.id,
+                area_name=area.name,
+                total=len(records),
+                pending=len([a for a in records if a.status == AnomalyStatus.PENDING]),
+                confirmed=len([a for a in records if a.status == AnomalyStatus.CONFIRMED]),
+                resolved=len([a for a in records if a.status == AnomalyStatus.RESOLVED]),
+                rejected=len([a for a in records if a.status == AnomalyStatus.REJECTED]),
+            ))
+        return result
+
+    def list_reservations_with_fulfillment(
+        self,
+        area_id: Optional[str] = None,
+        locker_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        status: Optional[ReservationStatus] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        is_overtime: Optional[bool] = None,
+    ) -> List[ReservationWithFulfillment]:
+        reservations = self.list_reservations(
+            area_id=area_id, locker_id=locker_id, user_name=user_name,
+            status=status, start_date=start_date, end_date=end_date, is_overtime=is_overtime,
+        )
+        result: List[ReservationWithFulfillment] = []
+        for res in reservations:
+            locker = self.get_locker(res.locker_id)
+            area = self.get_area(locker.area_id) if locker else None
+            anomalies = self.get_anomalies_for_reservation(res.id)
+            summary = self._compute_fulfillment_summary(res, locker, anomalies) if locker else None
+            data = res.model_dump()
+            result.append(ReservationWithFulfillment(
+                **data,
+                locker_number=locker.locker_number if locker else None,
+                area_id=locker.area_id if locker else None,
+                area_name=area.name if area else None,
+                fulfillment_summary=summary,
+                anomaly_count=len(anomalies),
+            ))
+        return result
+
+    def get_fulfillment_overview(self, area_id: Optional[str] = None) -> FulfillmentOverview:
+        reservations = self.list_reservations(area_id=area_id)
+        now = datetime.utcnow()
+        warning_count = 0
+        overdue_count = 0
+        overview = FulfillmentOverview(total_reservations=len(reservations))
+        for res in reservations:
+            locker = self.get_locker(res.locker_id)
+            if res.status == ReservationStatus.RESERVED:
+                overview.stage_reserved += 1
+                deadline = res.start_time + timedelta(minutes=settings.auto_checkin_timeout_minutes)
+                delta = int((deadline - now).total_seconds())
+                if 0 < delta <= 600:
+                    warning_count += 1
+                elif delta < 0:
+                    overdue_count += 1
+            elif res.status == ReservationStatus.CHECKED_IN:
+                overview.stage_checked_in += 1
+                delta = int((res.end_time - now).total_seconds())
+                if 0 < delta <= 1800:
+                    warning_count += 1
+                elif delta < 0:
+                    overdue_count += 1
+            elif res.status == ReservationStatus.OVERTIME:
+                overview.stage_overtime += 1
+                overdue_count += 1
+            elif res.status == ReservationStatus.RELEASED:
+                if locker and locker.status == LockerStatus.PENDING_RELEASE:
+                    overview.stage_released += 1
+                    if res.release:
+                        deadline = res.release.release_time + timedelta(hours=1)
+                        delta = int((deadline - now).total_seconds())
+                        if 0 < delta <= 600:
+                            warning_count += 1
+                        elif delta < 0:
+                            overdue_count += 1
+                else:
+                    overview.stage_completed += 1
+            elif res.status == ReservationStatus.CANCELLED:
+                overview.stage_cancelled += 1
+            elif res.status == ReservationStatus.NO_SHOW:
+                overview.stage_no_show += 1
+        overview.warning_count = warning_count
+        overview.overdue_count = overdue_count
+        return overview
 
     def disable_locker_with_validation(self, locker_id: str, reason_data: DisableReasonCreate) -> Optional[DisableReason]:
         check = self.check_locker_availability(locker_id)
         if not check:
             return None
-        if check.active_reservations:
+        if not check.can_disable:
             return None
         dr = self.create_disable_reason(reason_data)
         self.update_locker(locker_id, LockerUpdate(status=LockerStatus.DISABLED))
@@ -736,6 +1176,31 @@ class InMemoryDB:
     def create_anomaly_with_reporter(self, data: AnomalyRecordCreate, reporter: str) -> AnomalyRecord:
         data.reporter = reporter
         return self.create_anomaly_record(data)
+
+    def resolve_anomaly_with_notes(
+        self,
+        record_id: str,
+        resolve_data: AnomalyResolveData,
+        reviewer: str,
+    ) -> Optional[AnomalyRecord]:
+        record = self.get_anomaly_record(record_id)
+        if not record:
+            return None
+        if record.status not in {AnomalyStatus.PENDING, AnomalyStatus.CONFIRMED}:
+            return None
+        record.status = AnomalyStatus.RESOLVED
+        record.reviewer = reviewer
+        record.review_notes = resolve_data.review_notes
+        if resolve_data.handling_notes:
+            if record.supplementary_notes:
+                record.supplementary_notes = (record.supplementary_notes + "\n处理说明: " + resolve_data.handling_notes)
+            else:
+                record.supplementary_notes = "处理说明: " + resolve_data.handling_notes
+        record.reviewed_at = datetime.utcnow()
+        res = self.get_reservation(record.reservation_id) if record.reservation_id else None
+        locker = self.get_locker(record.locker_id) if record.locker_id else (self.get_locker(res.locker_id) if res else None)
+        self._sync_anomaly_resolved(record, res, locker)
+        return record
 
 
 db = InMemoryDB()
