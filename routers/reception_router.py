@@ -61,6 +61,16 @@ def create_reservation(data: ReservationCreate, current_user: User = Depends(req
         raise HTTPException(status_code=404, detail="储物格不存在")
     if locker.status == LockerStatus.DISABLED:
         raise HTTPException(status_code=400, detail="该储物格已停用，无法预约")
+    if locker.status == LockerStatus.PENDING_RELEASE:
+        raise HTTPException(status_code=400, detail="该储物格待确认释放，暂不可预约")
+    if locker.status != LockerStatus.AVAILABLE:
+        status_label = {
+            LockerStatus.RESERVED: "已被预约",
+            LockerStatus.IN_USE: "使用中",
+            LockerStatus.PENDING_RELEASE: "待确认释放",
+            LockerStatus.DISABLED: "已停用",
+        }.get(locker.status, locker.status)
+        raise HTTPException(status_code=400, detail=f"该储物格当前状态为{status_label}，无法预约")
 
     locker_active = db.get_active_reservations_for_locker(data.locker_id)
     for exist in locker_active:
@@ -150,8 +160,19 @@ def update_reservation(res_id: str, data: ReservationUpdate, _: User = Depends(r
     locker = db.get_locker(new_locker)
     if not locker:
         raise HTTPException(status_code=404, detail="目标储物格不存在")
-    if locker.status == LockerStatus.DISABLED:
-        raise HTTPException(status_code=400, detail="目标储物格已停用，无法预约")
+    if data.locker_id and data.locker_id != res.locker_id:
+        if locker.status == LockerStatus.DISABLED:
+            raise HTTPException(status_code=400, detail="目标储物格已停用，无法预约")
+        if locker.status == LockerStatus.PENDING_RELEASE:
+            raise HTTPException(status_code=400, detail="目标储物格待确认释放，暂不可预约")
+        if locker.status != LockerStatus.AVAILABLE:
+            status_label = {
+                LockerStatus.RESERVED: "已被预约",
+                LockerStatus.IN_USE: "使用中",
+                LockerStatus.PENDING_RELEASE: "待确认释放",
+                LockerStatus.DISABLED: "已停用",
+            }.get(locker.status, locker.status)
+            raise HTTPException(status_code=400, detail=f"目标储物格当前状态为{status_label}，无法预约")
 
     locker_active = db.get_active_reservations_for_locker(new_locker, exclude_res_id=res_id)
     for exist in locker_active:

@@ -150,6 +150,15 @@ def create_disable_reason(data: DisableReasonCreate, current_user: User = Depend
     locker = db.get_locker(data.locker_id)
     if not locker:
         raise HTTPException(status_code=400, detail="储物格不存在")
+    if locker.status == LockerStatus.DISABLED:
+        raise HTTPException(status_code=400, detail="该储物格已处于停用状态")
+    active_reservations = db.get_active_reservations_for_locker(data.locker_id)
+    if active_reservations:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该储物格存在 {len(active_reservations)} 个未完成预约，无法停用",
+        )
+    data.reporter = current_user.username
     dr = db.create_disable_reason(data)
     db.update_locker(data.locker_id, LockerUpdate(status=LockerStatus.DISABLED))
     return dr
@@ -170,11 +179,6 @@ def resolve_disable_reason(dr_id: str, current_user: User = Depends(require_admi
     if not dr:
         raise HTTPException(status_code=404, detail="停用原因不存在")
     dr = db.resolve_disable_reason(dr_id, current_user.username)
-    unresolved = db.list_disable_reasons(locker_id=dr.locker_id, resolved=False)
-    if not unresolved:
-        locker = db.get_locker(dr.locker_id)
-        if locker and locker.status == LockerStatus.DISABLED:
-            db.update_locker(dr.locker_id, LockerUpdate(status=LockerStatus.AVAILABLE))
     return dr
 
 

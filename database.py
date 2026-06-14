@@ -218,9 +218,21 @@ class InMemoryDB:
         dr.resolved = True
         dr.resolved_by = resolved_by
         dr.resolved_at = datetime.utcnow()
+        unresolved = self.list_disable_reasons(locker_id=dr.locker_id, resolved=False)
+        if not unresolved:
+            active_reservations = self.get_active_reservations_for_locker(dr.locker_id)
+            if not active_reservations:
+                locker = self.get_locker(dr.locker_id)
+                if locker and locker.status == LockerStatus.DISABLED:
+                    self.update_locker(dr.locker_id, LockerUpdate(status=LockerStatus.AVAILABLE))
         return dr
 
-    def create_reservation(self, data: ReservationCreate, created_by: str) -> Reservation:
+    def create_reservation(self, data: ReservationCreate, created_by: str) -> Optional[Reservation]:
+        locker = self.lockers.get(data.locker_id)
+        if not locker:
+            return None
+        if locker.status != LockerStatus.AVAILABLE:
+            return None
         res = Reservation(
             id=self._gen_id(),
             **data.model_dump(),
@@ -229,9 +241,7 @@ class InMemoryDB:
             created_by=created_by,
         )
         self.reservations[res.id] = res
-        locker = self.lockers.get(data.locker_id)
-        if locker and locker.status == LockerStatus.AVAILABLE:
-            locker.status = LockerStatus.RESERVED
+        locker.status = LockerStatus.RESERVED
         return res
 
     def get_reservation(self, res_id: str) -> Optional[Reservation]:
@@ -416,20 +426,73 @@ class InMemoryDB:
         return record
 
     def _sync_business_state_on_anomaly_review(self, record: AnomalyRecord):
-        if record.status != AnomalyStatus.RESOLVED:
-            return
-        if record.type == AnomalyType.RELEASE_CONFIRM_MISSING and record.reservation_id:
+        if record.reservation_id:
             res = self.get_reservation(record.reservation_id)
-            if res and res.release:
-                locker = self.get_locker(res.locker_id)
-                if locker and locker.status == LockerStatus.PENDING_RELEASE:
-                    locker.status = LockerStatus.AVAILABLE
-        if record.type == AnomalyType.NO_SHOW and record.reservation_id:
-            res = self.get_reservation(record.reservation_id)
-            if res and res.status == ReservationStatus.NO_SHOW:
-                locker = self.get_locker(res.locker_id)
-                if locker and locker.status in {LockerStatus.RESERVED}:
-                    locker.status = LockerStatus.AVAILABLE
+        else:
+            res = None
+        if record.locker_id:
+            locker = self.get_locker(record.locker_id)
+        elif res:
+            locker = self.get_locker(res.locker_id)
+        else:
+            locker = None
+
+        if record.status == AnomalyStatus.RESOLVED:
+            self._sync_anomaly_resolved(record, res, locker)
+        elif record.status == AnomalyStatus.REJECTED:
+            self._sync_anomaly_rejected(record, res, locker)
+
+    def _sync_anomaly_resolved(self, record: AnomalyRecord, res: Optional[Reservation], locker: Optional[Locker]):
+        if record.type == AnomalyType.OVERTIME and res and locker:
+            if not res.release:
+                now = datetime.utcnow()
+                res.release = ReleaseRecord(
+                    release_time=now,
+                    operator=record.reviewer or "system",
+                    handling_suggestion="超时异常处理完成，自动释放",
+                    remarks="异常解决时自动释放",
+                )
+                res.overtime_minutes = int((now - res.end_time).total_seconds() // 60)
+                res.is_overtime = True
+            if locker.status in {LockerStatus.IN_USE, LockerStatus.PENDING_RELEASE}:
+                locker.status = LockerStatus.AVAILABLE
+
+        elif record.type == AnomalyType.RELEASE_CONFIRM_MISSING and res and locker:
+            if res.release and locker.status == LockerStatus.PENDING_RELEASE:
+                locker.status = LockerStatus.AVAILABLE
+
+        elif record.type == AnomalyType.NO_SHOW and res and locker:
+            if locker.status == LockerStatus.RESERVED:
+                locker.status = LockerStatus.AVAILABLE
+
+        elif record.type == AnomalyType.DISABLED_LOCKER_RESERVED and locker:
+            pass
+
+        elif record.type == AnomalyType.ABNORMAL_OCCUPANCY and locker:
+            pass
+
+    def _sync_anomaly_rejected(self, record: AnomalyRecord, res: Optional[Reservation], locker: Optional[Locker]):
+        if record.type == AnomalyType.NO_SHOW and res and locker:
+            if res.status == ReservationStatus.NO_SHOW:
+                res.status = ReservationStatus.RESERVED
+                if locker.status == LockerStatus.AVAILABLE:
+                    locker.status = LockerStatus.RESERVED
+
+        elif record.type == AnomalyType.OVERTIME and res and locker:
+            if res.status == ReservationStatus.OVERTIME:
+                if res.release:
+                    res.status = ReservationStatus.RELEASED
+                else:
+                    res.status = ReservationStatus.CHECKED_IN
+
+        elif record.type == AnomalyType.RELEASE_CONFIRM_MISSING and res and locker:
+            pass
+
+        elif record.type == AnomalyType.DISABLED_LOCKER_RESERVED and locker:
+            pass
+
+        elif record.type == AnomalyType.ABNORMAL_OCCUPANCY and locker:
+            pass
 
     def update_anomaly_record(self, record_id: str, data: AnomalyRecordUpdate) -> Optional[AnomalyRecord]:
         record = self.anomaly_records.get(record_id)
