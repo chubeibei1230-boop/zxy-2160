@@ -213,7 +213,13 @@ def confirm_release(res_id: str, _: User = Depends(require_reception)):
         raise HTTPException(status_code=400, detail="仅已释放或超时状态可确认释放")
     if not res.release:
         raise HTTPException(status_code=400, detail="未执行释放操作，无法确认")
-    return db.confirm_release(res_id)
+    locker = db.get_locker(res.locker_id)
+    if locker and locker.status == LockerStatus.AVAILABLE:
+        raise HTTPException(status_code=400, detail="该预约已确认释放，无需重复操作")
+    result = db.confirm_release(res_id)
+    if not result:
+        raise HTTPException(status_code=400, detail="确认释放失败")
+    return result
 
 
 @router.get("/reservations/{res_id}/fulfillment", response_model=ReservationFulfillmentDetail)
@@ -334,12 +340,15 @@ def list_anomaly_types(_: User = Depends(require_reception)):
 
 @router.post("/reservations", response_model=Reservation, status_code=status.HTTP_201_CREATED)
 def create_reservation(data: ReservationCreate, current_user: User = Depends(require_reception)):
-    if data.start_time >= data.end_time:
+    start_naive = data.start_time.replace(tzinfo=None) if data.start_time.tzinfo else data.start_time
+    end_naive = data.end_time.replace(tzinfo=None) if data.end_time.tzinfo else data.end_time
+    now = datetime.utcnow()
+    if start_naive >= end_naive:
         raise HTTPException(status_code=400, detail="预约开始时间必须早于结束时间")
-    if data.start_time < datetime.utcnow():
+    if start_naive < now:
         raise HTTPException(status_code=400, detail="预约开始时间不能早于当前时间")
 
-    duration_hours = (data.end_time - data.start_time).total_seconds() / 3600
+    duration_hours = (end_naive - start_naive).total_seconds() / 3600
     rule = db.get_usage_rule()
     if duration_hours > rule.max_hours_per_reservation:
         raise HTTPException(
@@ -358,9 +367,14 @@ def create_reservation(data: ReservationCreate, current_user: User = Depends(req
         reasons = "; ".join(check.blocking_reasons)
         raise HTTPException(status_code=400, detail=f"储物格不可预约: {reasons}")
 
+    data.start_time = start_naive
+    data.end_time = end_naive
+
     locker_active = db.get_active_reservations_for_locker(data.locker_id)
     for exist in locker_active:
-        if _check_time_overlap(data.start_time, data.end_time, exist.start_time, exist.end_time):
+        exist_start = exist.start_time.replace(tzinfo=None) if exist.start_time.tzinfo else exist.start_time
+        exist_end = exist.end_time.replace(tzinfo=None) if exist.end_time.tzinfo else exist.end_time
+        if _check_time_overlap(start_naive, end_naive, exist_start, exist_end):
             raise HTTPException(
                 status_code=409,
                 detail=f"该储物格在 {exist.start_time} 至 {exist.end_time} 已被预约，时间重叠"
@@ -368,7 +382,9 @@ def create_reservation(data: ReservationCreate, current_user: User = Depends(req
 
     user_active = db.get_active_reservations_for_user(data.user_id_number)
     for exist in user_active:
-        if _check_time_overlap(data.start_time, data.end_time, exist.start_time, exist.end_time):
+        exist_start = exist.start_time.replace(tzinfo=None) if exist.start_time.tzinfo else exist.start_time
+        exist_end = exist.end_time.replace(tzinfo=None) if exist.end_time.tzinfo else exist.end_time
+        if _check_time_overlap(start_naive, end_naive, exist_start, exist_end):
             raise HTTPException(
                 status_code=409,
                 detail=f"该使用人在 {exist.start_time} 至 {exist.end_time} 已有预约（储物格: {exist.locker_id}），时间重叠"
@@ -376,7 +392,7 @@ def create_reservation(data: ReservationCreate, current_user: User = Depends(req
 
     same_day_reservations = [
         r for r in user_active
-        if r.start_time.date() == data.start_time.date()
+        if r.start_time.date() == start_naive.date()
     ]
     if len(same_day_reservations) >= rule.max_reservations_per_user_per_day:
         raise HTTPException(

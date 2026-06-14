@@ -320,6 +320,10 @@ class InMemoryDB:
         res = self.reservations.get(res_id)
         if not res:
             return None
+        if res.release:
+            return None
+        if res.status not in {ReservationStatus.CHECKED_IN, ReservationStatus.OVERTIME}:
+            return None
         release_time = datetime.utcnow()
         res.release = ReleaseRecord(
             release_time=release_time,
@@ -355,9 +359,16 @@ class InMemoryDB:
         res = self.reservations.get(res_id)
         if not res:
             return None
+        if not res.release:
+            return None
         locker = self.lockers.get(res.locker_id)
-        if locker:
-            locker.status = LockerStatus.AVAILABLE
+        if not locker:
+            return None
+        if locker.status == LockerStatus.AVAILABLE:
+            return None
+        if res.status in {ReservationStatus.OVERTIME, ReservationStatus.RELEASED}:
+            res.status = ReservationStatus.RELEASED
+        locker.status = LockerStatus.AVAILABLE
         return res
 
     def cancel_reservation(self, res_id: str) -> Optional[Reservation]:

@@ -81,15 +81,17 @@ def run_anomaly_detection() -> List[AnomalyRecord]:
         if locker.status == LockerStatus.DISABLED:
             active = db.get_active_reservations_for_locker(locker.id)
             if active:
-                exists = db.list_anomaly_records(anomaly_type=AnomalyType.DISABLED_LOCKER_RESERVED)
-                already = [a for a in exists if a.locker_id == locker.id and a.status != AnomalyStatus.RESOLVED]
-                if not already:
-                    anomaly = db.create_anomaly_record(AnomalyRecordCreate(
-                        type=AnomalyType.DISABLED_LOCKER_RESERVED,
-                        locker_id=locker.id,
-                        description=f"已停用储物格 {locker.locker_number} 仍存在未完成预约 {len(active)}个",
-                    ))
-                    new_anomalies.append(anomaly)
+                for res in active:
+                    exists = db.list_anomaly_records(anomaly_type=AnomalyType.DISABLED_LOCKER_RESERVED)
+                    already = [a for a in exists if a.reservation_id == res.id and a.status != AnomalyStatus.RESOLVED]
+                    if not already:
+                        anomaly = db.create_anomaly_record(AnomalyRecordCreate(
+                            type=AnomalyType.DISABLED_LOCKER_RESERVED,
+                            reservation_id=res.id,
+                            locker_id=locker.id,
+                            description=f"已停用储物格 {locker.locker_number} 仍存在未完成预约，使用人: {res.user_name}",
+                        ))
+                        new_anomalies.append(anomaly)
 
     return new_anomalies
 

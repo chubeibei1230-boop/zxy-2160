@@ -83,10 +83,35 @@ def get_locker(locker_id: str, _: User = Depends(require_admin)):
 
 @router.put("/lockers/{locker_id}", response_model=Locker)
 def update_locker(locker_id: str, data: LockerUpdate, _: User = Depends(require_admin)):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
     if data.area_id:
         area = db.get_area(data.area_id)
         if not area:
             raise HTTPException(status_code=400, detail="所属区域不存在")
+    if data.status and data.status != locker.status:
+        check = db.check_locker_availability(locker_id)
+        if data.status == LockerStatus.DISABLED:
+            if not check or not check.can_disable:
+                reasons = "; ".join(check.blocking_reasons) if check else "未知原因"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"无法直接停用储物格: {reasons}。请使用停用接口（POST /admin/lockers/{{id}}/disable）并填写停用原因。",
+                )
+        elif data.status == LockerStatus.AVAILABLE:
+            if locker.status == LockerStatus.DISABLED:
+                if not check or not check.can_restore:
+                    reasons = "; ".join(check.blocking_reasons) if check else "未知原因"
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"无法直接恢复储物格: {reasons}。请使用恢复接口（POST /admin/lockers/{{id}}/restore）。",
+                    )
+        elif data.status in {LockerStatus.IN_USE, LockerStatus.RESERVED, LockerStatus.PENDING_RELEASE}:
+            raise HTTPException(
+                status_code=400,
+                detail="不允许直接将储物格状态修改为使用中/已预约/待确认释放",
+            )
     locker = db.update_locker(locker_id, data)
     if not locker:
         raise HTTPException(status_code=404, detail="储物格不存在")
