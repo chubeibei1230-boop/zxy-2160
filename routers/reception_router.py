@@ -9,7 +9,8 @@ from schemas import (
     Reservation, ReservationCreate, ReservationUpdate, ReservationStatus,
     LockerStatus,
     MessageResponse,
-    AnomalyRecordCreate, AnomalyType,
+    AnomalyRecord, AnomalyRecordCreate, AnomalyRecordUpdate, AnomalyType, AnomalyStatus,
+    ReservationFulfillmentDetail,
 )
 from database import db
 from config import settings
@@ -253,3 +254,82 @@ def confirm_release(res_id: str, _: User = Depends(require_reception)):
     if not res.release:
         raise HTTPException(status_code=400, detail="未执行释放操作，无法确认")
     return db.confirm_release(res_id)
+
+
+@router.get("/reservations/{res_id}/fulfillment", response_model=ReservationFulfillmentDetail)
+def get_reservation_fulfillment(res_id: str, _: User = Depends(require_reception)):
+    detail = db.get_reservation_fulfillment_detail(res_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    return detail
+
+
+@router.post("/reservations/{res_id}/anomalies", response_model=AnomalyRecord, status_code=status.HTTP_201_CREATED)
+def raise_anomaly_for_reservation(
+    res_id: str,
+    anomaly_type: AnomalyType,
+    description: str,
+    supplementary_notes: Optional[str] = None,
+    current_user: User = Depends(require_reception),
+):
+    res = db.get_reservation(res_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    if res.status not in {
+        ReservationStatus.RESERVED,
+        ReservationStatus.CHECKED_IN,
+        ReservationStatus.OVERTIME,
+        ReservationStatus.RELEASED,
+    }:
+        raise HTTPException(status_code=400, detail="当前预约状态不支持发起异常")
+    data = AnomalyRecordCreate(
+        type=anomaly_type,
+        reservation_id=res.id,
+        locker_id=res.locker_id,
+        description=description,
+        supplementary_notes=supplementary_notes,
+        reporter=current_user.username,
+    )
+    return db.create_anomaly_record(data)
+
+
+@router.get("/reservations/{res_id}/anomalies", response_model=List[AnomalyRecord])
+def list_reservation_anomalies(res_id: str, _: User = Depends(require_reception)):
+    res = db.get_reservation(res_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    return db.get_anomalies_for_reservation(res_id)
+
+
+@router.put("/anomalies/{record_id}", response_model=AnomalyRecord)
+def supplement_anomaly(
+    record_id: str,
+    data: AnomalyRecordUpdate,
+    _: User = Depends(require_reception),
+):
+    record = db.get_anomaly_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="异常记录不存在")
+    if record.status in {AnomalyStatus.RESOLVED, AnomalyStatus.REJECTED}:
+        raise HTTPException(status_code=400, detail="该异常已处理完成，无法补充说明")
+    updated = db.update_anomaly_record(record_id, data)
+    if not updated:
+        raise HTTPException(status_code=500, detail="更新异常记录失败")
+    return updated
+
+
+@router.get("/anomalies/{record_id}", response_model=AnomalyRecord)
+def get_anomaly_detail(record_id: str, _: User = Depends(require_reception)):
+    record = db.get_anomaly_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="异常记录不存在")
+    return record
+
+
+@router.get("/anomalies", response_model=List[AnomalyRecord])
+def list_anomalies(
+    status_filter: Optional[AnomalyStatus] = None,
+    anomaly_type: Optional[AnomalyType] = None,
+    _: User = Depends(require_reception),
+):
+    return db.list_anomaly_records(status=status_filter, anomaly_type=anomaly_type)

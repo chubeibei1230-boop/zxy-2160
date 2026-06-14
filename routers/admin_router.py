@@ -11,7 +11,8 @@ from schemas import (
     UsageRule, UsageRuleUpdate,
     DisableReason, DisableReasonCreate,
     MessageResponse,
-    Reservation,
+    Reservation, ReservationStatus,
+    LockerAvailabilityCheck,
 )
 from database import db
 
@@ -193,3 +194,70 @@ def force_reservation_time(
     if end_time:
         res.end_time = datetime.fromisoformat(end_time)
     return res
+
+
+@router.get("/lockers/{locker_id}/availability-check", response_model=LockerAvailabilityCheck)
+def check_locker_availability(locker_id: str, _: User = Depends(require_admin)):
+    check = db.check_locker_availability(locker_id)
+    if not check:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    return check
+
+
+@router.post("/lockers/{locker_id}/disable", response_model=DisableReason, status_code=status.HTTP_201_CREATED)
+def disable_locker_with_check(
+    locker_id: str,
+    data: DisableReasonCreate,
+    current_user: User = Depends(require_admin),
+):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if locker.status == LockerStatus.DISABLED:
+        raise HTTPException(status_code=400, detail="该储物格已处于停用状态")
+    active_reservations = db.get_active_reservations_for_locker(locker_id)
+    if active_reservations:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该储物格存在 {len(active_reservations)} 个未完成预约，无法停用",
+        )
+    data.locker_id = locker_id
+    data.reporter = current_user.username
+    return db.disable_locker_with_validation(locker_id, data)
+
+
+@router.post("/lockers/{locker_id}/restore", response_model=Locker)
+def restore_locker_with_check(locker_id: str, _: User = Depends(require_admin)):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if locker.status != LockerStatus.DISABLED:
+        raise HTTPException(status_code=400, detail="该储物格未处于停用状态")
+    check = db.check_locker_availability(locker_id)
+    if not check:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    if not check.can_restore:
+        reasons = "; ".join(check.blocking_reasons)
+        raise HTTPException(status_code=400, detail=f"无法恢复储物格使用: {reasons}")
+    restored = db.restore_locker_with_validation(locker_id)
+    if not restored:
+        raise HTTPException(status_code=500, detail="恢复储物格失败")
+    return restored
+
+
+@router.get("/lockers/{locker_id}/active-reservations", response_model=List[Reservation])
+def list_locker_active_reservations(locker_id: str, _: User = Depends(require_admin)):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    return db.get_active_reservations_for_locker(locker_id)
+
+
+@router.get("/lockers/with-status", response_model=List[Locker])
+def list_lockers_with_status_check(
+    area_id: Optional[str] = None,
+    status_filter: Optional[LockerStatus] = None,
+    _: User = Depends(require_admin),
+):
+    lockers = db.list_lockers(area_id=area_id, status=status_filter)
+    return lockers

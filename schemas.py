@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Dict
 from enum import Enum
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -237,7 +237,8 @@ class AnomalyRecordBase(BaseModel):
 
 
 class AnomalyRecordCreate(AnomalyRecordBase):
-    pass
+    supplementary_notes: Optional[str] = None
+    reporter: Optional[str] = None
 
 
 class AnomalyReview(BaseModel):
@@ -252,6 +253,8 @@ class AnomalyRecord(BaseModel):
     reservation_id: Optional[str] = None
     locker_id: Optional[str] = None
     description: str
+    supplementary_notes: Optional[str] = None
+    reporter: Optional[str] = None
     status: AnomalyStatus = AnomalyStatus.PENDING
     reviewer: Optional[str] = None
     review_notes: Optional[str] = None
@@ -297,3 +300,61 @@ class ReservationQueryParams(BaseModel):
 class PaginatedResponse(BaseModel):
     total: int
     items: List
+
+
+class FulfillmentStep(BaseModel):
+    step: str
+    label: str
+    status: str
+    completed_at: Optional[datetime] = None
+    operator: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ReservationFulfillmentDetail(BaseModel):
+    reservation: Reservation
+    locker: Locker
+    fulfillment_steps: List[FulfillmentStep]
+    anomalies: List[AnomalyRecord]
+    can_raise_anomaly: bool
+    can_release: bool
+    can_confirm_release: bool
+
+
+class AnomalySupplement(BaseModel):
+    description: str
+    supplementary_notes: Optional[str] = None
+
+
+class AnomalyRecordUpdate(BaseModel):
+    supplementary_notes: Optional[str] = None
+    description: Optional[str] = None
+
+
+class LockerAvailabilityCheck(BaseModel):
+    locker_id: str
+    locker_number: str
+    current_status: LockerStatus
+    can_reserve: bool
+    can_restore: bool
+    blocking_reasons: List[str]
+    unresolved_disable_reasons: List[DisableReason]
+    active_reservations: List[Reservation]
+
+
+class AnomalyStatistics(BaseModel):
+    total: int
+    pending: int
+    confirmed: int
+    resolved: int
+    rejected: int
+    by_type: Dict[str, int]
+
+
+class AnomalyListQuery(BaseModel):
+    status: Optional[AnomalyStatus] = None
+    anomaly_type: Optional[AnomalyType] = None
+    reservation_id: Optional[str] = None
+    locker_id: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None

@@ -11,6 +11,7 @@ from schemas import (
     Locker, LockerStatus, LockerUpdate,
     AnomalyRecord, AnomalyType, AnomalyStatus, AnomalyRecordCreate,
     LockerOccupancyRate, OvertimeRankingItem,
+    AnomalyStatistics, ReservationFulfillmentDetail, LockerAvailabilityCheck,
 )
 from database import db
 from config import settings
@@ -198,3 +199,78 @@ def get_overtime_ranking(
 @router.get("/stats/pending-anomalies", response_model=List[AnomalyRecord])
 def get_pending_anomalies(_: User = Depends(require_supervisor)):
     return db.list_anomaly_records(status=AnomalyStatus.PENDING)
+
+
+@router.get("/reservations/{res_id}", response_model=Reservation)
+def get_reservation_detail(res_id: str, _: User = Depends(require_any_authenticated)):
+    res = db.get_reservation(res_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    return res
+
+
+@router.get("/reservations/{res_id}/fulfillment", response_model=ReservationFulfillmentDetail)
+def get_reservation_fulfillment_public(res_id: str, _: User = Depends(require_any_authenticated)):
+    detail = db.get_reservation_fulfillment_detail(res_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    return detail
+
+
+@router.get("/lockers/{locker_id}", response_model=Locker)
+def get_locker_detail(locker_id: str, _: User = Depends(require_any_authenticated)):
+    locker = db.get_locker(locker_id)
+    if not locker:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    return locker
+
+
+@router.get("/lockers/{locker_id}/availability", response_model=LockerAvailabilityCheck)
+def get_locker_availability_public(locker_id: str, _: User = Depends(require_any_authenticated)):
+    check = db.check_locker_availability(locker_id)
+    if not check:
+        raise HTTPException(status_code=404, detail="储物格不存在")
+    return check
+
+
+@router.get("/anomalies", response_model=List[AnomalyRecord])
+def query_anomalies_public(
+    status_filter: Optional[AnomalyStatus] = None,
+    anomaly_type: Optional[AnomalyType] = None,
+    reservation_id: Optional[str] = None,
+    locker_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: User = Depends(require_any_authenticated),
+):
+    sd = datetime.fromisoformat(start_date).date() if start_date else None
+    ed = datetime.fromisoformat(end_date).date() if end_date else None
+    return db.list_anomaly_records_enhanced(
+        status=status_filter,
+        anomaly_type=anomaly_type,
+        reservation_id=reservation_id,
+        locker_id=locker_id,
+        start_date=sd,
+        end_date=ed,
+    )
+
+
+@router.get("/anomalies/{record_id}", response_model=AnomalyRecord)
+def get_anomaly_detail_public(record_id: str, _: User = Depends(require_any_authenticated)):
+    record = db.get_anomaly_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="异常记录不存在")
+    return record
+
+
+@router.get("/stats/anomaly-overview", response_model=AnomalyStatistics)
+def get_anomaly_statistics_public(_: User = Depends(require_any_authenticated)):
+    return db.get_anomaly_statistics()
+
+
+@router.get("/reservations/{res_id}/anomalies", response_model=List[AnomalyRecord])
+def get_reservation_anomalies_public(res_id: str, _: User = Depends(require_any_authenticated)):
+    res = db.get_reservation(res_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="预约记录不存在")
+    return db.get_anomalies_for_reservation(res_id)
